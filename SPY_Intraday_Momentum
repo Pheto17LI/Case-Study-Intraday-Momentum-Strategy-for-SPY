@@ -1,0 +1,2407 @@
+# -*- coding: utf-8 -*-
+"""
+SPY Intraday Momentum - cleaned comparison script
+
+Credentials are read from environment variables:
+    ALPACA_API_KEY
+    ALPACA_SECRET_KEY
+"""
+
+import os
+import time
+import math
+import zipfile
+from pathlib import Path
+from datetime import datetime
+
+import requests
+import pandas as pd
+import numpy as np
+import pytz
+import matplotlib
+matplotlib.use("Agg")  # save all figures without blocking on macOS plot windows
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+from matplotlib.ticker import FuncFormatter
+import statsmodels.api as sm
+import torch
+from torch import nn
+from sklearn.linear_model import LogisticRegression
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import StandardScaler
+from sklearn.ensemble import RandomForestClassifier
+from hmmlearn.hmm import GaussianHMM
+
+
+# ============================================================
+# 0. CONFIGURATION
+# ============================================================
+
+TICKER = "SPY"
+FROM_DATE = "2016-01-01"
+UNTIL_DATE = "2026-10-03"
+FEED = "sip"
+
+AUM_0 = 100_000.0
+COMMISSION_PER_SHARE = 0.0035
+MIN_COMMISSION_PER_ORDER = 0.35
+SLIPPAGE_PER_SHARE = 0.001  # Paper baseline slippage assumption.
+
+LOOKBACK_DAYS = 14
+BAND_MULT = 1.0
+TRADE_FREQ_MIN = 30
+TARGET_DAILY_VOL = 0.02
+MAX_LEVERAGE = 4.0
+
+# Reporting controls
+SHOW_PLOTS = False  # Keep False: all figures are saved automatically.
+RUN_SENSITIVITY_ANALYSES = True
+VM_GRID = [0.50, 0.75, 1.00, 1.25, 1.50, 1.75, 2.00]
+COMMISSION_GRID = [0.0000, 0.0010, 0.0020, 0.0035, 0.0050, 0.0075, 0.0100]
+VIX_THRESHOLDS = [6, 8, 10, 12, 14, 16, 18, 20, 25, 30, 40, 50]
+
+# Chronological research split used for OWN v2 reporting and validation-only tuning.
+SPLIT_TRAIN_START = "2016-01-01"
+SPLIT_TRAIN_END = "2020-12-31"
+SPLIT_VALIDATION_START = "2021-01-01"
+SPLIT_VALIDATION_END = "2021-12-31"
+SPLIT_TEST_START = "2022-01-01"
+SPLIT_TEST_END = UNTIL_DATE
+
+# OWN v2: adaptive 2-day/14-day Noise Area + adaptive stop.
+OWN2_NAME = "Own Adaptive Noise + Adaptive Stop"
+OWN2_REGIME_THRESHOLDS = [0.10, 0.20, 0.30, 0.40, 0.50, 0.75]
+M9_NAME = "M9 BiLSTM q10/q90"
+M9_SEQUENCE_DAYS = 20
+M9_TRAIN_DAYS = 504
+M9_RETRAIN_DAYS = 504
+M9_EPOCHS = 18
+M9_HIDDEN_SIZE = 16
+M12_NAME = "M12 Inverse-Variance Current Band + VWAP"
+MAROY_ML_NAME = "Maroy Monthly-Validated Parameters"
+MAROY_HMM_NAME = "Maroy HMM Regime Parameters (VIX + RV)"
+MAROY_ML_PARAM_NAME = "Maroy ML-Predicted Parameters"
+MAROY_PARAMETER_CANDIDATES = [
+    {"name":"VWAP1_published", "lookback_days":2, "vol_mult_enter":1.03, "target_vol":0.013, "start_after_open":12, "trade_freq":45, "exit_before_close":13},
+    {"name":"VWAP2_published", "lookback_days":2, "vol_mult_enter":0.85, "target_vol":0.014, "start_after_open":12, "trade_freq":45, "exit_before_close":13},
+    {"name":"Fast_narrow", "lookback_days":2, "vol_mult_enter":0.75, "target_vol":0.010, "start_after_open":12, "trade_freq":45, "exit_before_close":13},
+    {"name":"Short_moderate", "lookback_days":4, "vol_mult_enter":0.90, "target_vol":0.020, "start_after_open":12, "trade_freq":45, "exit_before_close":13},
+    {"name":"Slow_standard", "lookback_days":5, "vol_mult_enter":1.00, "target_vol":0.013, "start_after_open":12, "trade_freq":30, "exit_before_close":13},
+    {"name":"Wide_high_target", "lookback_days":2, "vol_mult_enter":1.25, "target_vol":0.020, "start_after_open":12, "trade_freq":45, "exit_before_close":13},
+]
+MAROY_HMM_TRAIN_DAYS = 252
+
+# Maróy (2025), published VWAP #1 parameters from Table 10.
+# Important: Maróy optimized these parameters on QQQ using 1-second bars. Here they are
+# applied to SPY minute data as an external literature benchmark, while keeping OUR
+# commission/slippage assumptions for an apples-to-apples comparison.
+MAROY_NAME = "Maroy 2025 VWAP #1 (published params -> SPY)"
+MAROY_LOOKBACK_DAYS = 2
+MAROY_VOL_MULT_ENTER = 1.03
+MAROY_TARGET_VOL = 0.013
+MAROY_START_AFTER_OPEN_MIN = 12
+MAROY_TRADE_FREQ_MIN = 45
+MAROY_EXIT_BEFORE_CLOSE_MIN = 13
+MAROY_LONG_MARGIN_MULT = 4.0
+MAROY_SHORT_MARGIN_MULT = 1.0 / 0.30
+
+OUTPUT_DIR = Path.home() / "Downloads" / "SPY_Paper_Replication_Maroy_ML_Parameters_Output"
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+TABLE_DIR = OUTPUT_DIR / "tables"
+FIGURE_DIR = OUTPUT_DIR / "figures"
+DATA_DIR = OUTPUT_DIR / "data"
+for _p in (TABLE_DIR, FIGURE_DIR, DATA_DIR):
+    _p.mkdir(parents=True, exist_ok=True)
+
+CACHE_DIR = OUTPUT_DIR / "cache"
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+ALPACA_API_KEY = os.environ["ALPACA_API_KEY"]
+ALPACA_SECRET_KEY = os.environ["ALPACA_SECRET_KEY"]
+ALPACA_BASE_URL = "https://data.alpaca.markets"
+
+HEADERS = {
+    "APCA-API-KEY-ID": ALPACA_API_KEY,
+    "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY,
+}
+
+
+# ============================================================
+# 1. DATA DOWNLOAD / CACHE
+# ============================================================
+
+def fetch_alpaca_data(ticker, start_date, end_date, period, feed="sip"):
+    """Fetch 1-minute or 1-day bars and return paper-compatible columns."""
+    timeframe = {"minute": "1Min", "day": "1Day"}.get(period)
+    if timeframe is None:
+        raise ValueError("period must be 'minute' or 'day'")
+
+    url = f"{ALPACA_BASE_URL}/v2/stocks/{ticker}/bars"
+    params = {
+        "timeframe": timeframe,
+        "start": start_date,
+        "end": end_date,
+        "limit": 10000,
+        "adjustment": "raw",
+        "feed": feed,
+        "sort": "asc",
+    }
+
+    all_data = []
+    page_token = None
+    request_number = 0
+
+    while True:
+        if page_token is not None:
+            params["page_token"] = page_token
+        else:
+            params.pop("page_token", None)
+
+        response = requests.get(url, headers=HEADERS, params=params, timeout=60)
+
+        if response.status_code == 429:
+            retry_after = response.headers.get("Retry-After")
+            wait_time = int(retry_after) if retry_after else 10
+            print(f"Alpaca rate limit reached. Waiting {wait_time} seconds...")
+            time.sleep(wait_time)
+            continue
+
+        if response.status_code != 200:
+            print("\nALPACA REQUEST FAILED")
+            print("HTTP status:", response.status_code)
+            try:
+                print("Response:", response.json())
+            except Exception:
+                print("Response:", response.text[:2000])
+            raise RuntimeError(f"Alpaca API failed with HTTP {response.status_code}")
+
+        data = response.json()
+        bars = data.get("bars", [])
+        request_number += 1
+        print(f"Request {request_number}: Fetched {len(bars):,} {period} bars.")
+
+        for entry in bars:
+            ts = pd.Timestamp(entry["t"])
+            if ts.tzinfo is None:
+                ts = ts.tz_localize("UTC")
+            else:
+                ts = ts.tz_convert("UTC")
+            eastern_time = ts.tz_convert("America/New_York")
+            caldt = eastern_time.tz_localize(None)
+
+            row = {
+                "volume": entry["v"],
+                "open": entry["o"],
+                "high": entry["h"],
+                "low": entry["l"],
+                "close": entry["c"],
+                "caldt": caldt,
+            }
+
+            if period == "minute":
+                t = eastern_time.time()
+                if datetime.strptime("09:30", "%H:%M").time() <= t <= datetime.strptime("15:59", "%H:%M").time():
+                    all_data.append(row)
+            else:
+                all_data.append(row)
+
+        page_token = data.get("next_page_token")
+        if not page_token:
+            break
+
+    df = pd.DataFrame(all_data)
+    if df.empty:
+        raise RuntimeError(f"No Alpaca {period} data returned for {ticker} from {start_date} to {end_date}.")
+
+    df = (
+        df.sort_values("caldt")
+          .drop_duplicates(subset="caldt", keep="last")
+          .reset_index(drop=True)
+    )
+
+    print(f"{period.capitalize()} data complete: {len(df):,} observations.")
+
+    if period == "minute":
+        tmp = df.copy()
+        tmp["day"] = pd.to_datetime(tmp["caldt"]).dt.date
+        bars_per_day = tmp.groupby("day").size()
+        print(
+            "Regular-hours bars/day: "
+            f"median={bars_per_day.median():.0f}, min={bars_per_day.min()}, max={bars_per_day.max()}"
+        )
+
+    return df
+
+
+def fetch_alpaca_dividends(ticker, start_date, end_date):
+    """Fetch cash dividends, returning caldt and dividend."""
+    url = f"{ALPACA_BASE_URL}/v1/corporate-actions"
+    params = {
+        "symbols": ticker,
+        "types": "cash_dividend",
+        "start": start_date,
+        "end": end_date,
+        "limit": 1000,
+        "sort": "asc",
+    }
+
+    rows = []
+    page_token = None
+
+    while True:
+        if page_token:
+            params["page_token"] = page_token
+        else:
+            params.pop("page_token", None)
+
+        response = requests.get(url, headers=HEADERS, params=params, timeout=60)
+
+        if response.status_code == 429:
+            retry_after = response.headers.get("Retry-After")
+            wait_time = int(retry_after) if retry_after else 10
+            print(f"Dividend API rate limit. Waiting {wait_time} seconds...")
+            time.sleep(wait_time)
+            continue
+
+        if response.status_code != 200:
+            print("\nDIVIDEND REQUEST FAILED")
+            print("HTTP status:", response.status_code)
+            try:
+                print("Response:", response.json())
+            except Exception:
+                print("Response:", response.text[:2000])
+            raise RuntimeError("Alpaca dividend request failed.")
+
+        data = response.json()
+        for entry in data.get("cash_dividends", []):
+            ex_date = entry.get("ex_date")
+            rate = entry.get("rate")
+            if ex_date is not None and rate is not None:
+                rows.append({
+                    "caldt": datetime.strptime(ex_date, "%Y-%m-%d"),
+                    "dividend": float(rate),
+                })
+
+        page_token = data.get("next_page_token")
+        if not page_token:
+            break
+
+    out = pd.DataFrame(rows, columns=["caldt", "dividend"])
+    print(f"Fetched {len(out)} cash dividends.")
+    return out
+
+
+def load_or_download_data():
+    tag = f"{TICKER}_{FROM_DATE}_{UNTIL_DATE}_{FEED}".replace("-", "")
+
+    # Reuse caches from prior Task-3 script versions when available, so adding a new
+    # research variant does not trigger another million-row API download.
+    candidate_cache_dirs = [
+        CACHE_DIR,
+        Path.home() / "Downloads" / "SPY_Paper_Replication_Task3_v3_Output" / "cache",
+        Path.home() / "Downloads" / "SPY_Paper_Replication_Task3_Maroy_Output" / "cache",
+        Path.home() / "Downloads" / "SPY_Paper_Replication_Task3_Output" / "cache",
+    ]
+    chosen_cache = None
+    for cdir in candidate_cache_dirs:
+        mp = cdir / f"{tag}_minute.csv.gz"
+        dp = cdir / f"{tag}_daily.csv"
+        vp = cdir / f"{tag}_dividends.csv"
+        if mp.exists() and dp.exists() and vp.exists():
+            chosen_cache = cdir
+            break
+
+    if chosen_cache is not None:
+        minute_path = chosen_cache / f"{tag}_minute.csv.gz"
+        daily_path = chosen_cache / f"{tag}_daily.csv"
+        div_path = chosen_cache / f"{tag}_dividends.csv"
+        print(f"Loading cached Alpaca data from: {chosen_cache}")
+        minute = pd.read_csv(minute_path, parse_dates=["caldt"])
+        daily = pd.read_csv(daily_path, parse_dates=["caldt"])
+        dividends = pd.read_csv(div_path, parse_dates=["caldt"])
+    else:
+        minute_path = CACHE_DIR / f"{tag}_minute.csv.gz"
+        daily_path = CACHE_DIR / f"{tag}_daily.csv"
+        div_path = CACHE_DIR / f"{tag}_dividends.csv"
+        minute = fetch_alpaca_data(TICKER, FROM_DATE, UNTIL_DATE, "minute", FEED)
+        daily = fetch_alpaca_data(TICKER, FROM_DATE, UNTIL_DATE, "day", FEED)
+        dividends = fetch_alpaca_dividends(TICKER, FROM_DATE, UNTIL_DATE)
+        minute.to_csv(minute_path, index=False, compression="gzip")
+        daily.to_csv(daily_path, index=False)
+        dividends.to_csv(div_path, index=False)
+        print(f"Cached source data in: {CACHE_DIR}")
+
+    return minute, daily, dividends
+
+
+# ============================================================
+# 2. PREPARE PAPER VARIABLES
+# ============================================================
+
+def prepare_features(spy_intra_data, spy_daily_data, dividends):
+    df = spy_intra_data.copy()
+    df["caldt"] = pd.to_datetime(df["caldt"])
+    df["day"] = df["caldt"].dt.date
+    df = df.set_index("caldt").sort_index()
+
+    all_days = np.array(sorted(df["day"].unique()))
+
+    df["move_open"] = np.nan
+    df["vwap"] = np.nan
+    df["spy_dvol"] = np.nan
+
+    spy_ret = pd.Series(index=all_days, dtype=float)
+
+    groups = df.groupby("day")
+
+    # VWAP and move-from-open are available for every trading day.
+    for d, current_day in enumerate(all_days):
+        day_data = groups.get_group(current_day)
+        hlc = (day_data["high"] + day_data["low"] + day_data["close"]) / 3.0
+        cum_vol_x_hlc = (day_data["volume"] * hlc).cumsum()
+        cum_volume = day_data["volume"].cumsum()
+        df.loc[day_data.index, "vwap"] = cum_vol_x_hlc / cum_volume
+
+        open_price = day_data["open"].iloc[0]
+        df.loc[day_data.index, "move_open"] = (day_data["close"] / open_price - 1.0).abs()
+
+        if d > 0:
+            prev_day_data = groups.get_group(all_days[d - 1])
+            spy_ret.loc[current_day] = day_data["close"].iloc[-1] / prev_day_data["close"].iloc[-1] - 1.0
+
+        # Strict paper interpretation: previous 14 completed daily returns.
+        if d >= LOOKBACK_DAYS + 1:
+            recent = spy_ret.iloc[d - LOOKBACK_DAYS:d].dropna()
+            if len(recent) == LOOKBACK_DAYS:
+                df.loc[day_data.index, "spy_dvol"] = recent.std(ddof=1)
+
+    # 09:30 is minute 1, 09:59 is minute 30, etc.
+    df["min_from_open"] = (
+        (df.index - df.index.normalize()) / pd.Timedelta(minutes=1)
+        - (9 * 60 + 30)
+        + 1
+    )
+    df["minute_of_day"] = df["min_from_open"].round().astype(int)
+
+    # Same-minute average absolute move over previous 14 days, with no look-ahead.
+    minute_groups = df.groupby("minute_of_day")
+    df["move_open_rolling_mean"] = minute_groups["move_open"].transform(
+        lambda x: x.rolling(window=LOOKBACK_DAYS, min_periods=LOOKBACK_DAYS).mean()
+    )
+    df["sigma_open"] = minute_groups["move_open_rolling_mean"].transform(lambda x: x.shift(1))
+
+    # Fast 2-day same-minute Noise Area, inspired by Maroy's finding that shorter
+    # lookbacks can adapt more quickly.  This is available using PRIOR days only.
+    df["sigma_fast_2"] = minute_groups["move_open"].transform(
+        lambda x: x.rolling(window=2, min_periods=2).mean().shift(1)
+    )
+    ratio = df["sigma_fast_2"] / df["sigma_open"].replace(0, np.nan)
+    ratio = ratio.replace([np.inf, -np.inf], np.nan)
+    df["fast_slow_noise_ratio"] = ratio
+
+    # Parameter-free adaptive blend: when the most recent two days differ strongly
+    # from the 14-day regime, put more weight on the fast estimate.
+    # w=0 when fast==slow; w approaches 1 when the regime shift is large.
+    regime_score = (ratio - 1.0).abs().clip(lower=0.0, upper=1.0)
+    df["noise_regime_score"] = regime_score
+    df["adaptive_noise_weight"] = regime_score
+    df["sigma_adaptive"] = (
+        (1.0 - df["adaptive_noise_weight"]) * df["sigma_open"]
+        + df["adaptive_noise_weight"] * df["sigma_fast_2"]
+    )
+
+    # Preserve datetime index while mapping current-day ex-dividend amount.
+    if dividends is not None and not dividends.empty:
+        div = dividends.copy()
+        div["day"] = pd.to_datetime(div["caldt"]).dt.date
+        div_map = div.groupby("day")["dividend"].sum().to_dict()
+        df["dividend"] = df["day"].map(div_map).fillna(0.0)
+    else:
+        df["dividend"] = 0.0
+
+    # Daily SPY return series for benchmark/regression.
+    daily = spy_daily_data.copy()
+    daily["caldt"] = pd.to_datetime(daily["caldt"])
+    daily["day"] = daily["caldt"].dt.date
+    daily = daily.sort_values("day").drop_duplicates("day", keep="last").set_index("day")
+    daily["ret"] = daily["close"].pct_change()
+
+    return df, daily, all_days
+
+
+# ============================================================
+# 3. SIGNAL / EXPOSURE HELPERS
+# ============================================================
+
+def current_band_vwap_exposure(day_data, ub, lb):
+    """Paper's current-band + VWAP stop logic, checked every 30 minutes."""
+    close = day_data["close"].to_numpy()
+    vwap = day_data["vwap"].to_numpy()
+    ubv = ub.to_numpy() if isinstance(ub, pd.Series) else np.asarray(ub)
+    lbv = lb.to_numpy() if isinstance(lb, pd.Series) else np.asarray(lb)
+
+    raw_signal = np.zeros(len(day_data), dtype=float)
+    raw_signal[(close > ubv) & (close > vwap)] = 1.0
+    raw_signal[(close < lbv) & (close < vwap)] = -1.0
+
+    trade_idx = np.where(day_data["min_from_open"].to_numpy() % TRADE_FREQ_MIN == 0)[0]
+    decision = np.full(len(day_data), np.nan)
+    decision[trade_idx] = raw_signal[trade_idx]
+
+    last_valid = np.nan
+    filled = []
+    for value in decision:
+        if not np.isnan(value):
+            last_valid = value
+        if last_valid == 0:
+            last_valid = np.nan
+        filled.append(last_valid)
+
+    # Signal is observed on the completed minute; position applies to the next minute return.
+    return pd.Series(filled, index=day_data.index).shift(1).fillna(0.0).to_numpy()
+
+
+def opposite_band_exposure(day_data, ub, lb):
+    """Base strategy: once entered, hold until the opposite Noise Area band is crossed."""
+    close = day_data["close"].to_numpy()
+    ubv = ub.to_numpy() if isinstance(ub, pd.Series) else np.asarray(ub)
+    lbv = lb.to_numpy() if isinstance(lb, pd.Series) else np.asarray(lb)
+
+    trade_idx = np.where(day_data["min_from_open"].to_numpy() % TRADE_FREQ_MIN == 0)[0]
+    decision = np.full(len(day_data), np.nan)
+    state = 0.0
+
+    for i in trade_idx:
+        if state == 0:
+            if close[i] > ubv[i]:
+                state = 1.0
+            elif close[i] < lbv[i]:
+                state = -1.0
+        elif state > 0:
+            if close[i] < lbv[i]:
+                state = -1.0
+        else:
+            if close[i] > ubv[i]:
+                state = 1.0
+        decision[i] = state
+
+    # Forward fill state between semi-hourly checks.
+    series = pd.Series(decision, index=day_data.index).ffill().fillna(0.0)
+    return series.shift(1).fillna(0.0).to_numpy()
+
+
+def extract_trade_records(day_data, exposure, strategy_name, day, shares):
+    """Convert minute exposure into round-trip trade records for audit / paper-style trade table."""
+    close = day_data["close"].to_numpy(dtype=float)
+    timestamps = day_data.index.to_numpy()
+    records = []
+
+    if len(close) < 2:
+        return records
+
+    start_i = None
+    direction = 0.0
+
+    for i in range(1, len(exposure)):
+        exp_i = float(exposure[i])
+        exp_prev = float(exposure[i - 1])
+
+        # Start or reversal: exposure at i earns close[i]-close[i-1], so entry is close[i-1].
+        if exp_i != 0 and exp_i != exp_prev:
+            if exp_prev != 0 and start_i is not None:
+                exit_idx = i - 1
+                entry_price = close[start_i - 1]
+                exit_price = close[exit_idx]
+                pnl_per_share = direction * (exit_price - entry_price)
+                ret_pct = direction * (exit_price / entry_price - 1.0) * 100.0
+                records.append({
+                    "Strategy": strategy_name,
+                    "Day": day,
+                    "Direction": "Long" if direction > 0 else "Short",
+                    "Entry Time": pd.Timestamp(timestamps[start_i - 1]),
+                    "Exit Time": pd.Timestamp(timestamps[exit_idx]),
+                    "Entry Price": entry_price,
+                    "Exit Price": exit_price,
+                    "Gross PnL / Share": pnl_per_share,
+                    "Trade Return (%)": ret_pct,
+                    "Shares": shares,
+                })
+            start_i = i
+            direction = exp_i
+
+        # Exit to flat.
+        elif exp_i == 0 and exp_prev != 0 and start_i is not None:
+            exit_idx = i - 1
+            entry_price = close[start_i - 1]
+            exit_price = close[exit_idx]
+            pnl_per_share = direction * (exit_price - entry_price)
+            ret_pct = direction * (exit_price / entry_price - 1.0) * 100.0
+            records.append({
+                "Strategy": strategy_name,
+                "Day": day,
+                "Direction": "Long" if direction > 0 else "Short",
+                "Entry Time": pd.Timestamp(timestamps[start_i - 1]),
+                "Exit Time": pd.Timestamp(timestamps[exit_idx]),
+                "Entry Price": entry_price,
+                "Exit Price": exit_price,
+                "Gross PnL / Share": pnl_per_share,
+                "Trade Return (%)": ret_pct,
+                "Shares": shares,
+            })
+            start_i = None
+            direction = 0.0
+
+    # Force any open position out at the market close (last regular-hours close).
+    if exposure[-1] != 0 and start_i is not None:
+        entry_price = close[start_i - 1]
+        exit_price = close[-1]
+        pnl_per_share = direction * (exit_price - entry_price)
+        ret_pct = direction * (exit_price / entry_price - 1.0) * 100.0
+        records.append({
+            "Strategy": strategy_name,
+            "Day": day,
+            "Direction": "Long" if direction > 0 else "Short",
+            "Entry Time": pd.Timestamp(timestamps[start_i - 1]),
+            "Exit Time": pd.Timestamp(timestamps[-1]),
+            "Entry Price": entry_price,
+            "Exit Price": exit_price,
+            "Gross PnL / Share": pnl_per_share,
+            "Trade Return (%)": ret_pct,
+            "Shares": shares,
+        })
+
+    return records
+
+
+# ============================================================
+# 4. RUN ONE STRATEGY
+# ============================================================
+
+def run_strategy(df, daily, all_days, strategy_name, stop_type, sizing_type, band_mult=BAND_MULT, commission_per_share=COMMISSION_PER_SHARE, slippage_per_share=SLIPPAGE_PER_SHARE):
+    groups = df.groupby("day")
+    out = pd.DataFrame(index=all_days)
+    out.index.name = "Day"
+    out["ret"] = np.nan
+    out["AUM"] = np.nan
+    out["orders"] = 0
+    out["shares"] = np.nan
+    out["leverage"] = np.nan
+
+    current_aum = AUM_0
+    trade_records = []
+
+    for d, current_day in enumerate(all_days):
+        out.loc[current_day, "AUM"] = current_aum
+
+        if d == 0 or current_day not in groups.groups or all_days[d - 1] not in groups.groups:
+            continue
+
+        day_data = groups.get_group(current_day)
+        prev_data = groups.get_group(all_days[d - 1])
+
+        if day_data["sigma_open"].isna().all():
+            continue
+
+        # Use a common warm-up so the three strategies are compared over the same days.
+        spx_vol = day_data["spy_dvol"].iloc[0]
+        if pd.isna(spx_vol):
+            continue
+
+        prev_close_adjusted = prev_data["close"].iloc[-1] - day_data["dividend"].iloc[0]
+        open_price = day_data["open"].iloc[0]
+        sigma_open = day_data["sigma_open"]
+
+        ub = max(open_price, prev_close_adjusted) * (1.0 + band_mult * sigma_open)
+        lb = min(open_price, prev_close_adjusted) * (1.0 - band_mult * sigma_open)
+
+        if stop_type == "opposite_band":
+            exposure = opposite_band_exposure(day_data, ub, lb)
+        elif stop_type == "current_band_vwap":
+            exposure = current_band_vwap_exposure(day_data, ub, lb)
+        else:
+            raise ValueError("Unknown stop_type")
+
+        if sizing_type == "full_notional":
+            leverage = 1.0
+        elif sizing_type == "vol_target":
+            leverage = min(TARGET_DAILY_VOL / spx_vol, MAX_LEVERAGE)
+        else:
+            raise ValueError("Unknown sizing_type")
+
+        shares = round(current_aum / open_price * leverage)
+        out.loc[current_day, "shares"] = shares
+        out.loc[current_day, "leverage"] = leverage
+
+        close = day_data["close"]
+        change_1m = close.diff().to_numpy(dtype=float)
+        gross_pnl = np.nansum(exposure * change_1m) * shares
+
+        # Each unit of absolute exposure change is one order; reversal counts as two orders.
+        orders = int(np.sum(np.abs(np.diff(np.append(exposure, 0.0)))))
+        commission_paid = orders * max(MIN_COMMISSION_PER_ORDER, commission_per_share * shares)
+        slippage_paid = orders * slippage_per_share * shares
+        net_pnl = gross_pnl - commission_paid - slippage_paid
+
+        daily_ret = net_pnl / current_aum if current_aum != 0 else np.nan
+        current_aum += net_pnl
+
+        out.loc[current_day, "ret"] = daily_ret
+        out.loc[current_day, "AUM"] = current_aum
+        out.loc[current_day, "orders"] = orders
+
+        trade_records.extend(extract_trade_records(day_data, exposure, strategy_name, current_day, shares))
+
+    return out, pd.DataFrame(trade_records)
+
+
+def return_stats_for_period(result, start_date, end_date):
+    idx = pd.to_datetime(result.index.astype(str))
+    mask = (idx >= pd.Timestamp(start_date)) & (idx <= pd.Timestamp(end_date))
+    r = result.loc[mask, "ret"].dropna().astype(float)
+    if r.empty:
+        return {"Observations": 0, "Total Return (%)": np.nan, "IRR (%)": np.nan,
+                "Vol (%)": np.nan, "Sharpe Ratio": np.nan, "Hit Ratio (%)": np.nan,
+                "MDD (%)": np.nan}
+    aum = AUM_0 * (1.0 + r).cumprod()
+    sd = r.std(ddof=1)
+    return {
+        "Observations": len(r),
+        "Total Return (%)": ((1.0 + r).prod() - 1.0) * 100.0,
+        "IRR (%)": ((1.0 + r).prod() ** (252.0 / len(r)) - 1.0) * 100.0,
+        "Vol (%)": sd * np.sqrt(252.0) * 100.0,
+        "Sharpe Ratio": r.mean() / sd * np.sqrt(252.0) if sd > 0 else np.nan,
+        "Hit Ratio (%)": (r[r != 0] > 0).mean() * 100.0 if (r != 0).any() else np.nan,
+        "MDD (%)": max_drawdown_from_aum(aum),
+    }
+
+
+def split_comparison_table(baseline, maroy_result, own2_result, m9_result=None):
+    rows = []
+    periods = [
+        ("Train", SPLIT_TRAIN_START, SPLIT_TRAIN_END),
+        ("Validation", SPLIT_VALIDATION_START, SPLIT_VALIDATION_END),
+        ("Test", SPLIT_TEST_START, SPLIT_TEST_END),
+    ]
+    items = [
+        ("Paper Dynamic Baseline", baseline),
+        ("Maroy 2025 VWAP #1 adaptation", maroy_result),
+        ("OWN v2 Adaptive Noise + Stop", own2_result),
+    ]
+    if m9_result is not None:
+        items.append((M9_NAME, m9_result))
+    for name in (M12_NAME, MAROY_ML_NAME, MAROY_HMM_NAME, MAROY_ML_PARAM_NAME):
+        if name in globals().get("_SPLIT_RESULTS", {}): items.append((name, _SPLIT_RESULTS[name]))
+    for label, start, end in periods:
+        for name, result in items:
+            rows.append({"Split": label, "Strategy": name, **return_stats_for_period(result, start, end)})
+    return pd.DataFrame(rows)
+
+
+def save_task3_test_equity_chart(baseline, maroy_result, own2_result, spy_ret, path, m9_result=None):
+    start = pd.Timestamp(SPLIT_TEST_START)
+    end = pd.Timestamp(SPLIT_TEST_END)
+    series = {
+        "Paper Dynamic Baseline": baseline["ret"].copy(),
+        "Maroy 2025 VWAP #1 adaptation": maroy_result["ret"].copy(),
+        "OWN v2 Adaptive Noise + Stop": own2_result["ret"].copy(),
+        "SPY Buy & Hold": spy_ret.copy(),
+    }
+    if m9_result is not None:
+        series[M9_NAME] = m9_result["ret"].copy()
+    curves = {}
+    for name, x in series.items():
+        x.index = pd.to_datetime(x.index.astype(str))
+        x = x.loc[(x.index >= start) & (x.index <= end)].fillna(0.0)
+        curves[name] = AUM_0 * (1.0 + x).cumprod()
+    save_equity_chart(
+        curves, path,
+        "Task 3 test-period comparison",
+        f"TEST: {SPLIT_TEST_START} to {SPLIT_TEST_END} | same commission/slippage",
+    )
+
+
+def save_split_sharpe_chart(split_table, path):
+    pivot = split_table.pivot(index="Split", columns="Strategy", values="Sharpe Ratio").reindex(["Train", "Validation", "Test"])
+    fig, ax = plt.subplots(figsize=(9, 5.5))
+    x = np.arange(len(pivot.index))
+    width = min(0.22, 0.80 / max(1, len(pivot.columns)))
+    cols = list(pivot.columns)
+    for j, col in enumerate(cols):
+        vals = pivot[col].to_numpy(dtype=float)
+        ax.bar(x + (j - (len(cols)-1)/2)*width, vals, width, label=col)
+        for xi, v in zip(x + (j - (len(cols)-1)/2)*width, vals):
+            if np.isfinite(v):
+                ax.text(xi, v, f"{v:.2f}", ha="center", va="bottom" if v >= 0 else "top", fontsize=9)
+    ax.axhline(0, linewidth=0.8)
+    ax.set_xticks(x)
+    ax.set_xticklabels(pivot.index)
+    ax.set_ylabel("Sharpe Ratio")
+    ax.set_title("Paper baseline vs Maroy vs OWN v2 by chronological split", fontweight="bold")
+    ax.legend()
+    ax.grid(axis="y", linestyle="--", alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+
+
+# ============================================================
+# 4D. IMPROVED OWN STRATEGY - ADAPTIVE NOISE + ADAPTIVE STOP
+# ============================================================
+
+def adaptive_noise_stop_exposure(day_data, ub, lb, regime_threshold):
+    """
+    Own v2 strategy.
+
+    1) Entry boundary uses sigma_adaptive: a dynamic blend of the 2-day and 14-day
+       same-minute Noise Area estimates.
+    2) Every valid adaptive breakout is taken; there is no ML entry filter.
+    3) Stop mode is determined by the observable fast-vs-slow regime-change score:
+         score >= threshold -> VWAP-only stop (give a changing regime more room)
+         score <  threshold -> current adaptive band + VWAP stop
+    4) Decisions/stops remain at the paper's 30-minute schedule.
+    """
+    close = day_data["close"].to_numpy(dtype=float)
+    vwap = day_data["vwap"].to_numpy(dtype=float)
+    ubv = ub.to_numpy(dtype=float)
+    lbv = lb.to_numpy(dtype=float)
+    score = day_data["noise_regime_score"].to_numpy(dtype=float)
+
+    long_entry = (close > ubv) & (close > vwap)
+    short_entry = (close < lbv) & (close < vwap)
+    trade_idx = np.where(day_data["min_from_open"].to_numpy() % TRADE_FREQ_MIN == 0)[0]
+
+    decision = np.full(len(day_data), np.nan)
+    state = 0.0
+    loose_vwap_only = False
+
+    def choose_loose(i):
+        x = score[i]
+        return bool(np.isfinite(x) and x >= regime_threshold)
+
+    for i in trade_idx:
+        c = float(close[i])
+        vw = float(vwap[i])
+
+        if state == 0.0:
+            if long_entry[i]:
+                state = 1.0
+                loose_vwap_only = choose_loose(i)
+            elif short_entry[i]:
+                state = -1.0
+                loose_vwap_only = choose_loose(i)
+
+        elif state > 0:
+            if c <= vw:
+                if short_entry[i]:
+                    state = -1.0
+                    loose_vwap_only = choose_loose(i)
+                else:
+                    state = 0.0
+                    loose_vwap_only = False
+            elif (not loose_vwap_only) and c <= float(ubv[i]):
+                state = 0.0
+                loose_vwap_only = False
+
+        else:
+            if c >= vw:
+                if long_entry[i]:
+                    state = 1.0
+                    loose_vwap_only = choose_loose(i)
+                else:
+                    state = 0.0
+                    loose_vwap_only = False
+            elif (not loose_vwap_only) and c >= float(lbv[i]):
+                state = 0.0
+                loose_vwap_only = False
+
+        decision[i] = state
+
+    series = pd.Series(decision, index=day_data.index).ffill().fillna(0.0)
+    return series.shift(1).fillna(0.0).to_numpy()
+
+
+def run_adaptive_noise_stop_strategy(df, daily, all_days, regime_threshold,
+                                     strategy_name=OWN2_NAME):
+    """Backtest the improved own strategy with paper dynamic sizing."""
+    groups = df.groupby("day")
+    out = pd.DataFrame(index=all_days)
+    out.index.name = "Day"
+    out["ret"] = np.nan
+    out["AUM"] = np.nan
+    out["orders"] = 0
+    out["shares"] = np.nan
+    out["leverage"] = np.nan
+    out["noise_regime_threshold"] = regime_threshold
+
+    current_aum = AUM_0
+    trade_records = []
+
+    for d, current_day in enumerate(all_days):
+        out.loc[current_day, "AUM"] = current_aum
+        if d == 0 or current_day not in groups.groups or all_days[d - 1] not in groups.groups:
+            continue
+
+        day_data = groups.get_group(current_day)
+        prev_data = groups.get_group(all_days[d - 1])
+        if day_data["sigma_adaptive"].isna().all():
+            continue
+        spx_vol = day_data["spy_dvol"].iloc[0]
+        if pd.isna(spx_vol):
+            continue
+
+        prev_close_adjusted = prev_data["close"].iloc[-1] - day_data["dividend"].iloc[0]
+        open_price = float(day_data["open"].iloc[0])
+        sigma = day_data["sigma_adaptive"]
+        ub = max(open_price, prev_close_adjusted) * (1.0 + BAND_MULT * sigma)
+        lb = min(open_price, prev_close_adjusted) * (1.0 - BAND_MULT * sigma)
+
+        exposure = adaptive_noise_stop_exposure(day_data, ub, lb, regime_threshold)
+        leverage = min(TARGET_DAILY_VOL / float(spx_vol), MAX_LEVERAGE)
+        shares = round(current_aum / open_price * leverage)
+
+        change_1m = day_data["close"].diff().to_numpy(dtype=float)
+        gross_pnl = np.nansum(exposure * change_1m) * shares
+        orders = int(np.sum(np.abs(np.diff(np.append(exposure, 0.0)))))
+        commission_paid = orders * max(MIN_COMMISSION_PER_ORDER, COMMISSION_PER_SHARE * shares)
+        slippage_paid = orders * SLIPPAGE_PER_SHARE * shares
+        net_pnl = gross_pnl - commission_paid - slippage_paid
+        daily_ret = net_pnl / current_aum if current_aum != 0 else np.nan
+        current_aum += net_pnl
+
+        out.loc[current_day, "ret"] = daily_ret
+        out.loc[current_day, "AUM"] = current_aum
+        out.loc[current_day, "orders"] = orders
+        out.loc[current_day, "shares"] = shares
+        out.loc[current_day, "leverage"] = leverage
+        trade_records.extend(extract_trade_records(day_data, exposure, strategy_name, current_day, shares))
+
+    return out, pd.DataFrame(trade_records)
+
+
+def choose_adaptive_noise_threshold(df, daily, all_days):
+    """Choose only the regime-score stop cutoff on 2021 VALIDATION."""
+    rows, result_cache, trade_cache = [], {}, {}
+    for q in OWN2_REGIME_THRESHOLDS:
+        res, trades = run_adaptive_noise_stop_strategy(
+            df, daily, all_days, q,
+            strategy_name=f"{OWN2_NAME} q={q:.2f}",
+        )
+        st = return_stats_for_period(res, SPLIT_VALIDATION_START, SPLIT_VALIDATION_END)
+        rows.append({"Regime Score Threshold": q, **st})
+        result_cache[q] = res
+        trade_cache[q] = trades
+
+    tuning = pd.DataFrame(rows)
+    eligible = tuning.dropna(subset=["Sharpe Ratio"]).copy()
+    if eligible.empty:
+        chosen_q = 0.30
+    else:
+        best = eligible.sort_values(
+            ["Sharpe Ratio", "IRR (%)", "MDD (%)"],
+            ascending=[False, False, True],
+        ).iloc[0]
+        chosen_q = float(best["Regime Score Threshold"])
+    return chosen_q, tuning, result_cache[chosen_q], trade_cache[chosen_q]
+
+
+def _m9_quantile_bounds(minute_data, daily, all_days, vix=None):
+    """Causal BiLSTM q10/q90 curves, trained only on sessions before each block."""
+    torch.manual_seed(19)
+    np.random.seed(19)
+    torch.set_num_threads(1)
+    days = pd.Index(all_days)
+    raw = minute_data.copy()
+    raw["caldt"] = pd.to_datetime(raw["caldt"])
+    raw["day"] = raw["caldt"].dt.date
+    raw = raw.sort_values("caldt")
+
+    grouped = raw.groupby("day", sort=True)
+    close = grouped["close"].last().reindex(days).astype(float)
+    open_day = grouped["open"].first().reindex(days).astype(float)
+    high = grouped["high"].max().reindex(days).astype(float)
+    low = grouped["low"].min().reindex(days).astype(float)
+    daily_ret = close.pct_change()
+    raw["intraday_logret"] = raw.groupby("day", sort=True)["close"].transform(
+        lambda s: np.log(s.astype(float) / s.astype(float).shift(1))
+    )
+    rv = raw.groupby("day", sort=True)["intraday_logret"].apply(
+        lambda s: float(np.sqrt(np.nansum(np.square(s.to_numpy(dtype=float)))))
+    ).reindex(days).fillna(0.0)
+    overnight = open_day / close.shift(1) - 1.0
+
+    state = pd.DataFrame(index=days)
+    state["rv1"] = rv.shift(1)
+    state["rv5"] = rv.shift(1).rolling(5, min_periods=3).mean()
+    state["rv22"] = rv.shift(1).rolling(22, min_periods=10).mean()
+    state["prev_range"] = (high - low).shift(1) / close.shift(1)
+    state["prev_ret"] = daily_ret.shift(1)
+    state["overnight"] = overnight
+    state["abs_overnight"] = overnight.abs()
+    state["vol5"] = grouped["volume"].sum().reindex(days).shift(1).rolling(5, min_periods=3).mean()
+    state["vix"] = np.nan
+    state["vix_change"] = np.nan
+    if vix is not None and not vix.empty:
+        vv = vix.copy()
+        vv["Date"] = pd.to_datetime(vv["Date"], errors="coerce").dt.date
+        vv = vv.dropna(subset=["Date"]).drop_duplicates("Date").set_index("Date")["VIX_Open"]
+        state["vix"] = vv.reindex(days).shift(1)
+        state["vix_change"] = state["vix"].pct_change()
+    state = state.replace([np.inf, -np.inf], np.nan)
+    basecols = list(state.columns)
+
+    # A row is the observed session's close/open return curve, sampled every 10m.
+    surface = raw.assign(minute_of_day=(
+        (pd.to_datetime(raw["caldt"]) - pd.to_datetime(raw["caldt"]).dt.normalize())
+        / pd.Timedelta(minutes=1) - (9 * 60 + 30) + 1
+    ).round().astype(int)).pivot_table(
+        index="day", columns="minute_of_day", values="close", aggfunc="last"
+    ).reindex(index=days, columns=range(1, 391))
+    surface = surface.ffill(axis=1).T.fillna(open_day).T
+    surface = surface.div(open_day, axis=0) - 1.0
+    horizons = np.arange(10, 391, 10)
+    target = surface.loc[:, horizons].to_numpy(dtype=float)
+    state_values = state[basecols].to_numpy(dtype=float)
+
+    class BiLSTMQuantile(nn.Module):
+        def __init__(self, feature_count, context_count):
+            super().__init__()
+            self.lstm = nn.LSTM(feature_count, M9_HIDDEN_SIZE, batch_first=True, bidirectional=True)
+            self.head = nn.Sequential(
+                nn.Linear(2 * M9_HIDDEN_SIZE + context_count, 32), nn.ReLU(),
+                nn.Linear(32, 2 * len(horizons)),
+            )
+
+        def forward(self, x, context):
+            encoded = self.lstm(x)[0][:, -1, :]
+            return self.head(torch.cat([encoded, context], dim=1))
+
+    def pinball_loss(pred, y):
+        p10, p90 = pred[:, :len(horizons)], pred[:, len(horizons):]
+        e10, e90 = y - p10, y - p90
+        return torch.maximum(0.10 * e10, -0.90 * e10).mean() + torch.maximum(0.90 * e90, -0.10 * e90).mean()
+
+    lower = np.full((len(days), 390), np.nan, dtype=float)
+    upper = np.full((len(days), 390), np.nan, dtype=float)
+    for block in range(0, len(days), M9_RETRAIN_DAYS):
+        if block < 120:
+            continue
+        stop = min(block + M9_RETRAIN_DAYS, len(days))
+        train_start = max(M9_SEQUENCE_DAYS, block - M9_TRAIN_DAYS)
+        train_ids = range(train_start, block)
+        if block <= train_start:
+            continue
+
+        state_med = np.nanmedian(state_values[:block], axis=0)
+        state_sd = np.nanstd(state_values[:block], axis=0)
+        state_med[~np.isfinite(state_med)] = 0.0
+        state_sd[~np.isfinite(state_sd) | (state_sd < 1e-8)] = 1.0
+        state_scaled = (np.where(np.isfinite(state_values), state_values, state_med) - state_med) / state_sd
+        surf_med = np.nanmedian(target[:block], axis=0)
+        surf_sd = np.nanstd(target[:block], axis=0)
+        surf_med[~np.isfinite(surf_med)] = 0.0
+        surf_sd[~np.isfinite(surf_sd) | (surf_sd < 1e-8)] = 1.0
+        target_scaled = (np.where(np.isfinite(target), target, surf_med) - surf_med) / surf_sd
+
+        seqs, contexts, ys = [], [], []
+        for j in train_ids:
+            if j < M9_SEQUENCE_DAYS:
+                continue
+            seqs.append(np.concatenate([
+                target_scaled[j-M9_SEQUENCE_DAYS:j],
+                state_scaled[j-M9_SEQUENCE_DAYS:j],
+            ], axis=1))
+            contexts.append(state_scaled[j])
+            ys.append(target_scaled[j])
+        if len(ys) < 60:
+            continue
+        xseq = torch.tensor(np.asarray(seqs), dtype=torch.float32)
+        xctx = torch.tensor(np.asarray(contexts), dtype=torch.float32)
+        y = torch.tensor(np.asarray(ys), dtype=torch.float32)
+        model = BiLSTMQuantile(xseq.shape[2], xctx.shape[1])
+        optimizer = torch.optim.Adam(model.parameters(), lr=0.002, weight_decay=0.001)
+        model.train()
+        for _ in range(M9_EPOCHS):
+            optimizer.zero_grad()
+            loss = pinball_loss(model(xseq, xctx), y)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+
+        model.eval()
+        with torch.no_grad():
+            for i in range(max(block, M9_SEQUENCE_DAYS), stop):
+                seq = np.concatenate([
+                    target_scaled[i-M9_SEQUENCE_DAYS:i],
+                    state_scaled[i-M9_SEQUENCE_DAYS:i],
+                ], axis=1)[None, :, :]
+                pred = model(
+                    torch.tensor(seq, dtype=torch.float32),
+                    torch.tensor(state_scaled[i:i+1], dtype=torch.float32),
+                ).numpy()[0]
+                q10 = pred[:len(horizons)] * surf_sd + surf_med
+                q90 = pred[len(horizons):] * surf_sd + surf_med
+                # Anchor the central day-open reference while preserving asymmetry.
+                q10 = np.minimum(q10, 0.0)
+                q90 = np.maximum(q90, 0.0)
+                lower[i] = open_day.iloc[i] * (1.0 + np.interp(np.arange(1, 391), horizons, q10))
+                upper[i] = open_day.iloc[i] * (1.0 + np.interp(np.arange(1, 391), horizons, q90))
+        print(f"M9 BiLSTM fitted through session {stop}/{len(days)}", flush=True)
+    return lower, upper
+
+
+def run_m9_bilstm_strategy(df, daily, all_days, vix=None):
+    """Run M9's asymmetric q10/q90 price bounds through Current Band + VWAP."""
+    lower, upper = _m9_quantile_bounds(df.reset_index(), daily, all_days, vix=vix)
+    groups = df.groupby("day")
+    out = pd.DataFrame(index=all_days, columns=["ret", "AUM", "orders", "shares", "leverage"], dtype=float)
+    out["ret"] = np.nan
+    out["orders"] = 0
+    current_aum = AUM_0
+    trades = []
+    for i, day in enumerate(all_days):
+        out.loc[day, "AUM"] = current_aum
+        if i == 0 or day not in groups.groups or all_days[i-1] not in groups.groups:
+            continue
+        day_data = groups.get_group(day)
+        if day_data["sigma_open"].isna().all() or pd.isna(day_data["spy_dvol"].iloc[0]):
+            continue
+        if not np.isfinite(lower[i]).all() or not np.isfinite(upper[i]).all():
+            continue
+        idx = np.clip(day_data["min_from_open"].to_numpy(dtype=int) - 1, 0, 389)
+        lb = pd.Series(lower[i, idx], index=day_data.index)
+        ub = pd.Series(upper[i, idx], index=day_data.index)
+        exposure = current_band_vwap_exposure(day_data, ub, lb)
+        leverage = min(TARGET_DAILY_VOL / float(day_data["spy_dvol"].iloc[0]), MAX_LEVERAGE)
+        open_price = float(day_data["open"].iloc[0])
+        shares = round(current_aum / open_price * leverage)
+        gross_pnl = np.nansum(exposure * day_data["close"].diff().to_numpy(dtype=float)) * shares
+        orders = int(np.sum(np.abs(np.diff(np.append(exposure, 0.0)))))
+        costs = orders * max(MIN_COMMISSION_PER_ORDER, COMMISSION_PER_SHARE * shares)
+        costs += orders * SLIPPAGE_PER_SHARE * shares
+        net_pnl = gross_pnl - costs
+        out.loc[day, "ret"] = net_pnl / current_aum if current_aum else np.nan
+        current_aum += net_pnl
+        out.loc[day, "AUM"] = current_aum
+        out.loc[day, "orders"] = orders
+        out.loc[day, "shares"] = shares
+        out.loc[day, "leverage"] = leverage
+        trades.extend(extract_trade_records(day_data, exposure, M9_NAME, day, shares))
+    return out, pd.DataFrame(trades)
+
+
+# ============================================================
+# 4C. MAROY (2025) VWAP #1 - PUBLISHED-PARAMETER ADAPTATION
+# ============================================================
+
+MAROY_LOOKBACKS = sorted({int(p["lookback_days"]) for p in MAROY_PARAMETER_CANDIDATES} | {MAROY_LOOKBACK_DAYS})
+
+def prepare_maroy_features(df, daily):
+    """Prepare no-lookahead same-minute noise widths and realized vol per lookback."""
+    work = df.copy()
+    minute_groups = work.groupby("minute_of_day")["move_open"]
+    for lookback in MAROY_LOOKBACKS:
+        work[f"maroy_sigma_{lookback}"] = minute_groups.transform(
+            lambda x, n=lookback: x.shift(1).rolling(window=n, min_periods=n).mean()
+        )
+    d = daily.copy().sort_index()
+    for lookback in MAROY_LOOKBACKS:
+        d[f"maroy_dvol_{lookback}"] = d["ret"].shift(1).rolling(
+            window=lookback, min_periods=lookback
+        ).std(ddof=1)
+    return work, d
+
+
+def _published_maroy_params():
+    return {"name":"VWAP1_published", "lookback_days":MAROY_LOOKBACK_DAYS,
+            "vol_mult_enter":MAROY_VOL_MULT_ENTER, "target_vol":MAROY_TARGET_VOL,
+            "start_after_open":MAROY_START_AFTER_OPEN_MIN, "trade_freq":MAROY_TRADE_FREQ_MIN,
+            "exit_before_close":MAROY_EXIT_BEFORE_CLOSE_MIN}
+
+def _order_cost(shares):
+    shares = int(abs(shares))
+    if shares <= 0:
+        return 0.0
+    return max(MIN_COMMISSION_PER_ORDER, COMMISSION_PER_SHARE * shares) + SLIPPAGE_PER_SHARE * shares
+
+
+def run_maroy_vwap1_strategy(df, daily, all_days, params=None, strategy_name=MAROY_NAME,
+                             parameter_schedule=None, prepared=None):
+    """Run Maroy VWAP-touch + time-exit with fixed params or a causal daily schedule."""
+    default_params = _published_maroy_params() if params is None else dict(params)
+    work, daily_features = prepared if prepared is not None else prepare_maroy_features(df, daily)
+    groups = work.groupby("day")
+    out = pd.DataFrame(index=all_days)
+    out.index.name = "Day"
+    out["ret"] = np.nan; out["AUM"] = np.nan; out["orders"] = 0
+    out["shares"] = np.nan; out["leverage"] = np.nan
+    out["selected_profile"] = ""
+    current_aum = AUM_0
+    trade_records = []
+
+    for d, current_day in enumerate(all_days):
+        out.loc[current_day, "AUM"] = current_aum
+        p = (parameter_schedule or {}).get(pd.Timestamp(current_day).date(), default_params)
+        out.loc[current_day, "selected_profile"] = p.get("name", "custom")
+        if d == 0 or current_day not in groups.groups or all_days[d-1] not in groups.groups:
+            continue
+        day_data = groups.get_group(current_day).copy()
+        prev_data = groups.get_group(all_days[d-1])
+        lookback = int(p["lookback_days"])
+        sigma_col = f"maroy_sigma_{lookback}"
+        dvol_col = f"maroy_dvol_{lookback}"
+        dvol = float(daily_features.loc[current_day, dvol_col]) if current_day in daily_features.index else np.nan
+        sigma = day_data[sigma_col].astype(float)
+        if not np.isfinite(dvol) or dvol <= 0 or sigma.isna().all():
+            continue
+
+        day_start_aum = current_aum
+        open_price = float(day_data["open"].iloc[0])
+        prev_close = float(prev_data["close"].iloc[-1])  # Match the Maroy no-dividend-adjustment convention.
+        ub = max(open_price, prev_close) * (1.0 + float(p["vol_mult_enter"]) * sigma)
+        lb = min(open_price, prev_close) * (1.0 - float(p["vol_mult_enter"]) * sigma)
+        elapsed = day_data["min_from_open"].to_numpy(dtype=float) - 1.0
+        cutoff_elapsed = 390 - int(p["exit_before_close"])
+        cutoff_candidates = np.where(elapsed >= cutoff_elapsed)[0]
+        cutoff_i = int(cutoff_candidates[0]) if len(cutoff_candidates) else len(day_data)-1
+        start_after = int(p["start_after_open"]); trade_freq = int(p["trade_freq"])
+        decision_idx = np.where((elapsed >= start_after) & (elapsed < cutoff_elapsed)
+            & (((elapsed-start_after) % trade_freq) == 0))[0]
+        decision_set = set(int(i) for i in decision_idx)
+
+        position=0; shares=0; entry_price=np.nan; entry_time=None
+        first_leverage=np.nan; daily_orders=0; last_shares=np.nan
+
+        def close_position(exit_price, exit_time):
+            nonlocal current_aum, position, shares, entry_price, entry_time, daily_orders, last_shares
+            if position == 0 or shares <= 0: return
+            gross_per_share = position * (float(exit_price)-float(entry_price))
+            current_aum += gross_per_share * shares - _order_cost(shares)
+            daily_orders += 1
+            trade_records.append({"Strategy":strategy_name,"Day":current_day,
+                "Direction":"Long" if position>0 else "Short","Entry Time":pd.Timestamp(entry_time),
+                "Exit Time":pd.Timestamp(exit_time),"Entry Price":float(entry_price),
+                "Exit Price":float(exit_price),"Gross PnL / Share":gross_per_share,
+                "Trade Return (%)":position*(float(exit_price)/float(entry_price)-1)*100,
+                "Shares":shares,"Parameter Profile":p.get("name","custom")})
+            last_shares=shares; position=0; shares=0; entry_price=np.nan; entry_time=None
+
+        for i in range(len(day_data)):
+            row=day_data.iloc[i]; ts=day_data.index[i]
+            if i >= cutoff_i:
+                if position != 0: close_position(float(row["open"]),ts)
+                break
+            if position>0 and float(row["low"]) <= float(row["vwap"]):
+                close_position(min(float(row["open"]),float(row["vwap"])),ts)
+            elif position<0 and float(row["high"]) >= float(row["vwap"]):
+                close_position(max(float(row["open"]),float(row["vwap"])),ts)
+            if position==0 and i in decision_set and i+1<cutoff_i:
+                sigma_i=float(sigma.iloc[i])
+                if not np.isfinite(sigma_i) or sigma_i<=0: continue
+                long_excess=float(row["high"])-float(ub.iloc[i])
+                short_excess=float(lb.iloc[i])-float(row["low"])
+                long_hit=long_excess>0; short_hit=short_excess>0
+                if not long_hit and not short_hit: continue
+                direction=(1 if long_excess>=short_excess else -1) if long_hit and short_hit else (1 if long_hit else -1)
+                next_row=day_data.iloc[i+1]; next_ts=day_data.index[i+1]; px=float(next_row["open"])
+                if px<=0: continue
+                margin_mult=MAROY_LONG_MARGIN_MULT if direction>0 else MAROY_SHORT_MARGIN_MULT
+                vol_scale=min(1.0,float(p["target_vol"])/dvol)
+                target_notional=current_aum*margin_mult*vol_scale
+                new_shares=int(math.floor(target_notional/px))
+                if new_shares<=0: continue
+                current_aum-=_order_cost(new_shares); daily_orders+=1
+                position=direction; shares=new_shares; entry_price=px; entry_time=next_ts
+                last_shares=shares
+                if not np.isfinite(first_leverage): first_leverage=target_notional/max(day_start_aum,1e-12)
+
+        if position!=0: close_position(float(day_data["close"].iloc[-1]),day_data.index[-1])
+        daily_ret=(current_aum/day_start_aum-1) if day_start_aum else np.nan
+        out.loc[current_day,"ret"]=daily_ret; out.loc[current_day,"AUM"]=current_aum
+        out.loc[current_day,"orders"]=daily_orders; out.loc[current_day,"shares"]=last_shares
+        out.loc[current_day,"leverage"]=first_leverage
+    return out,pd.DataFrame(trade_records)
+
+
+def run_m12_inverse_variance_strategy(df, daily, all_days):
+    """M12: base current-band/VWAP signal with inverse-variance leverage."""
+    groups=df.groupby("day"); out=pd.DataFrame(index=all_days,columns=["ret","AUM","orders","shares","leverage"],dtype=float)
+    out["ret"]=np.nan; out["orders"]=0; aum=AUM_0; trades=[]
+    for i,day in enumerate(all_days):
+        out.loc[day,"AUM"]=aum
+        if i==0 or day not in groups.groups or all_days[i-1] not in groups.groups: continue
+        x=groups.get_group(day); prev=groups.get_group(all_days[i-1]); vol=float(x["spy_dvol"].iloc[0])
+        if x["sigma_open"].isna().all() or not np.isfinite(vol) or vol<=0: continue
+        op=float(x["open"].iloc[0]); pc=float(prev["close"].iloc[-1])-float(x["dividend"].iloc[0]); sig=x["sigma_open"]
+        ub=max(op,pc)*(1+BAND_MULT*sig); lb=min(op,pc)*(1-BAND_MULT*sig)
+        exposure=current_band_vwap_exposure(x,ub,lb); lev=min((TARGET_DAILY_VOL/vol)**2,MAX_LEVERAGE)
+        shares=round(aum/op*lev); gross=np.nansum(exposure*x["close"].diff().to_numpy(dtype=float))*shares
+        orders=int(np.sum(np.abs(np.diff(np.append(exposure,0.0)))))
+        cost=orders*max(MIN_COMMISSION_PER_ORDER,COMMISSION_PER_SHARE*shares)+orders*SLIPPAGE_PER_SHARE*shares
+        aum0=aum; aum+=gross-cost; out.loc[day,["ret","AUM","orders","shares","leverage"]]=[(aum-aum0)/aum0,aum,orders,shares,lev]
+        trades.extend(extract_trade_records(x,exposure,M12_NAME,day,shares))
+    return out,pd.DataFrame(trades)
+
+
+def _month_key(day):
+    return pd.Timestamp(day).to_period("M")
+
+
+def _candidate_validation_score(result, dates):
+    vals=result.loc[list(dates),"ret"].dropna().astype(float) if len(dates) else pd.Series(dtype=float)
+    if len(vals)<10: return (-np.inf,-np.inf)
+    sd=vals.std(ddof=1); sharpe=vals.mean()/sd*np.sqrt(252) if sd>0 else -np.inf
+    return (float(sharpe),float(((1+vals).prod()-1)))
+
+
+def build_monthly_maroy_schedule(candidate_results, all_days):
+    """Use prior calendar month only to choose a fixed Maroy profile for next month."""
+    schedule={}; rows=[]; profile_map={p["name"]:p for p in MAROY_PARAMETER_CANDIDATES}; published=_published_maroy_params()
+    months=sorted({_month_key(d) for d in all_days})
+    for month in months:
+        val_month=month-1; val_dates=[d for d in all_days if _month_key(d)==val_month]
+        scores={name:_candidate_validation_score(res,val_dates) for name,res in candidate_results.items()}
+        eligible=[n for n,s in scores.items() if np.isfinite(s[0])]
+        chosen=max(eligible,key=lambda n:(scores[n][0],scores[n][1])) if eligible else published["name"]
+        params=profile_map.get(chosen,published)
+        for day in all_days:
+            if _month_key(day)==month: schedule[pd.Timestamp(day).date()]=params
+        rows.append({"Deployment Month":str(month),"Validation Month":str(val_month),"Selected Profile":chosen,
+                     "Validation Sharpe":scores.get(chosen,(-np.inf,np.nan))[0],"Validation Return (%)":scores.get(chosen,(-np.inf,np.nan))[1],
+                     "Validation Sessions":len(val_dates),"Fallback":not bool(eligible)})
+    return schedule,pd.DataFrame(rows)
+
+
+def build_maroy_ml_parameter_schedule(df,daily,all_days,candidate_results,vix,baseline_schedule):
+    """Walk-forward Random Forest predicts next month's best Maroy profile.
+
+    Training examples are prior months. Each example's features are computed at
+    that month's start; its label is the best candidate's realized Sharpe that
+    month. Only fully completed months are used to predict the next month.
+    """
+    candidates={p["name"]:p for p in MAROY_PARAMETER_CANDIDATES}
+    sessions=[pd.Timestamp(x).date() for x in all_days]
+    daily_work=daily.copy(); daily_work.index=[pd.Timestamp(x).date() for x in daily_work.index]
+    vix_series=pd.Series(dtype=float)
+    if vix is not None and not vix.empty:
+        v=vix.copy(); v["Date"]=pd.to_datetime(v["Date"]).dt.date
+        vix_series=v.set_index("Date")["VIX_Open"].astype(float)
+    groups=df.groupby("day"); gaps={}
+    for i,day in enumerate(sessions):
+        if i>0 and day in groups.groups and sessions[i-1] in groups.groups:
+            op=float(groups.get_group(day)["open"].iloc[0])
+            pc=float(groups.get_group(sessions[i-1])["close"].iloc[-1])
+            gaps[day]=op/pc-1.0
+    ret=daily_work["ret"].reindex(sessions).astype(float)
+    gap=pd.Series(gaps,dtype=float).reindex(sessions)
+    vix_open=vix_series.reindex(sessions)
+    out_features={}; month_ids=sorted({_month_key(x) for x in sessions})
+    for month in month_ids:
+        days=[x for x in sessions if _month_key(x)==month]
+        first=days[0]; loc=sessions.index(first); prior=sessions[max(0,loc-21):loc]
+        r=ret.reindex(prior).dropna(); g=gap.reindex(prior).dropna(); vx=vix_open.reindex(prior).dropna()
+        last_vix=float(vix_open.reindex(sessions[:loc]).dropna().iloc[-1]) if vix_open.reindex(sessions[:loc]).notna().any() else np.nan
+        out_features[month]={
+            "rv5":float(r.tail(5).std(ddof=1)) if len(r)>=3 else np.nan,
+            "rv20":float(r.tail(20).std(ddof=1)) if len(r)>=10 else np.nan,
+            "prior_21d_return":float((1+r).prod()-1) if len(r)>=10 else np.nan,
+            "prior_month_return":float((1+r.tail(21)).prod()-1) if len(r)>=10 else np.nan,
+            "overnight_gap_mean":float(g.mean()) if len(g)>=5 else np.nan,
+            "overnight_gap_abs_mean":float(g.abs().mean()) if len(g)>=5 else np.nan,
+            "vix_prior_mean":float(vx.mean()) if len(vx)>=5 else np.nan,
+            "vix_last":last_vix,
+            "vix_change_21d":float(vix_open.reindex(sessions[:loc]).dropna().pct_change(21).iloc[-1]) if vix_open.reindex(sessions[:loc]).dropna().shape[0]>21 else np.nan,
+        }
+    feature_df=pd.DataFrame.from_dict(out_features,orient="index").sort_index()
+    # Retain available features and impute with expanding past median, never future values.
+    feature_df=feature_df.replace([np.inf,-np.inf],np.nan)
+    feature_df=feature_df.ffill()
+    schedule={}; rows=[]
+    for month in month_ids:
+        # Labels for months strictly before deployment month are now known.
+        train_months=[m for m in month_ids if m<month]
+        train_x=[]; train_y=[]
+        for past in train_months:
+            x=feature_df.loc[past]
+            if x.isna().any(): continue
+            dates=[d for d in sessions if _month_key(d)==past]
+            scores={name:_candidate_validation_score(res,dates) for name,res in candidate_results.items()}
+            valid=[name for name,score in scores.items() if np.isfinite(score[0])]
+            if valid:
+                label=max(valid,key=lambda name:(scores[name][0],scores[name][1]))
+                train_x.append(x.to_numpy(dtype=float)); train_y.append(label)
+        x_now=feature_df.loc[month]
+        fallback=baseline_schedule.get(pd.Timestamp(sessions[next(i for i,d in enumerate(sessions) if _month_key(d)==month)]).date(),_published_maroy_params())
+        selected=fallback.get("name",_published_maroy_params()["name"]); mode="prior-month validation fallback"; confidence=np.nan
+        if len(train_y)>=12 and len(set(train_y))>=2 and not x_now.isna().any():
+            model=RandomForestClassifier(n_estimators=200,max_depth=3,min_samples_leaf=2,
+                class_weight="balanced_subsample",random_state=42,n_jobs=1)
+            model.fit(np.asarray(train_x),np.asarray(train_y))
+            x_scaled=np.asarray(x_now,dtype=float).reshape(1,-1)
+            probs=model.predict_proba(x_scaled)[0]; ix=int(np.argmax(probs))
+            selected=str(model.classes_[ix]); confidence=float(probs[ix]); mode="walk-forward random forest"
+        params=candidates.get(selected,fallback)
+        for day in sessions:
+            if _month_key(day)==month: schedule[day]=params
+        rows.append({"Deployment Month":str(month),"Selected Profile":selected,"Selection Method":mode,
+                     "Training Months":len(train_y),"Training Classes":len(set(train_y)),
+                     "Predicted Class Probability":confidence,**{f"Feature_{k}":v for k,v in feature_df.loc[month].to_dict().items()}})
+    return schedule,pd.DataFrame(rows)
+
+
+def _maroy_state_features(daily, all_days, vix):
+    d=daily.copy(); d.index=[pd.Timestamp(x).date() for x in d.index]
+    feat=pd.DataFrame(index=[pd.Timestamp(x).date() for x in all_days])
+    ret=d["ret"].reindex(feat.index)
+    feat["rv5"]=ret.shift(1).rolling(5,min_periods=5).std()
+    feat["rv20"]=ret.shift(1).rolling(20,min_periods=15).std()
+    groups=None
+    # Overnight gap is calculated from current session open and prior completed close.
+    feat["overnight_gap"]=np.nan
+    # day-level OHLC/open may not be in daily input; caller injects this from intraday below.
+    if vix is not None and not vix.empty:
+        vv=vix.copy(); vv["Date"]=pd.to_datetime(vv["Date"]).dt.date
+        v=vv.set_index("Date")["VIX_Open"].reindex(feat.index)
+        feat["vix_open"]=v
+        feat["vix_change"]=v.pct_change()
+    return feat
+
+
+def build_maroy_hmm_schedule(df,daily,all_days,candidate_results,vix):
+    """Monthly refit two-state Gaussian HMM; state/profile map learned on trailing data."""
+    from hmmlearn.hmm import GaussianHMM
+    intraday=df.groupby("day")
+    feat=_maroy_state_features(daily,all_days,vix)
+    previous_close=np.nan
+    gaps={}
+    for i,day in enumerate(all_days):
+        if day not in intraday.groups: continue
+        x=intraday.get_group(day)
+        if i>0 and all_days[i-1] in intraday.groups:
+            pc=float(intraday.get_group(all_days[i-1])["close"].iloc[-1]); gaps[pd.Timestamp(day).date()]=float(x["open"].iloc[0])/pc-1
+    feat["overnight_gap"]=pd.Series(gaps)
+    feat["abs_gap"]=feat["overnight_gap"].abs()
+    cols=[c for c in ["rv5","rv20","overnight_gap","abs_gap","vix_open","vix_change"] if c in feat and feat[c].notna().sum()>30]
+    # Robustly fill initial feature warmup from past observations only.
+    feat=feat[cols].replace([np.inf,-np.inf],np.nan).ffill()
+    schedule={}; logs=[]; months=sorted({_month_key(d) for d in all_days}); profile_map={p["name"]:p for p in MAROY_PARAMETER_CANDIDATES}; fallback=_published_maroy_params()
+    for month in months:
+        target=[pd.Timestamp(d).date() for d in all_days if _month_key(d)==month]
+        end_idx=min((feat.index.get_loc(target[0]) if target and target[0] in feat.index else len(feat)),len(feat))
+        start_idx=max(0,end_idx-MAROY_HMM_TRAIN_DAYS)
+        train=feat.iloc[start_idx:end_idx].dropna()
+        state_map={}; model=None; mean=None; scale=None
+        try:
+            if len(train)<80 or len(cols)<2: raise ValueError("insufficient trailing HMM data/features")
+            mean=train.mean(); scale=train.std().replace(0,1); z=((train-mean)/scale).clip(-6,6)
+            model=GaussianHMM(n_components=2,covariance_type="diag",n_iter=100,random_state=17,min_covar=1e-4).fit(z.to_numpy())
+            states=model.predict(z.to_numpy())
+            for state in range(2):
+                ix=train.index[np.asarray(states)==state]
+                choices=[]
+                for name,res in candidate_results.items():
+                    ds=[pd.Timestamp(x).date() for x in ix if x in res.index]
+                    sc=_candidate_validation_score(res,ds)
+                    if np.isfinite(sc[0]): choices.append((sc[0],sc[1],name))
+                if choices: state_map[state]=profile_map[max(choices)[2]]
+            if not state_map: raise ValueError("no state has sufficient candidate returns")
+        except Exception as exc:
+            logs.append({"Deployment Month":str(month),"State":-1,"Selected Profile":fallback["name"],"Training Observations":len(train),"Features":";".join(cols),"Note":str(exc)})
+        alpha=None
+        for day in target:
+            p=fallback; state=-1
+            if model is not None and day in feat.index and feat.loc[day].notna().all():
+                obs=((feat.loc[day]-mean)/scale).to_numpy(dtype=float).clip(-6,6)
+                # Causal HMM filtering: previous filtered alpha predicts current state.
+                if alpha is None:
+                    prior=model.startprob_
+                else: prior=alpha @ model.transmat_
+                variances=np.diagonal(model.covars_,axis1=1,axis2=2) if model.covars_.ndim==3 else model.covars_
+                variances=np.maximum(variances,1e-8)
+                log_emission=-0.5*np.sum(np.log(2*np.pi*variances)+((obs-model.means_)**2)/variances,axis=1)
+                emission=np.exp(log_emission-np.max(log_emission)); alpha=prior*emission
+                alpha=alpha/alpha.sum() if alpha.sum()>0 else model.startprob_
+                state=int(np.argmax(alpha)); p=state_map.get(state,fallback)
+            schedule[day]=p; logs.append({"Deployment Month":str(month),"State":state,"Selected Profile":p["name"],"Training Observations":len(train),"Features":";".join(cols),"Note":"filtered HMM posterior" if model is not None else "fallback"})
+    return schedule,pd.DataFrame(logs)
+
+
+# ============================================================
+# 5. PERFORMANCE STATISTICS
+# ============================================================
+
+def max_drawdown_from_aum(aum):
+    x = aum.dropna().astype(float)
+    if x.empty:
+        return np.nan
+    # Include the initial capital so a loss on the first backtest day is captured.
+    x = pd.concat([pd.Series([AUM_0], index=["Initial"]), x])
+    running_max = x.cummax()
+    dd = x / running_max - 1.0
+    return -dd.min() * 100.0
+
+
+def portfolio_stats(name, stop_label, size_label, result, spy_ret):
+    r = result["ret"].dropna().astype(float)
+    if r.empty:
+        return {}
+
+    total_return = ((1.0 + r).prod() - 1.0) * 100.0
+    irr = ((1.0 + r).prod() ** (252.0 / len(r)) - 1.0) * 100.0
+    vol = r.std(ddof=1) * np.sqrt(252.0) * 100.0
+    sharpe = (r.mean() / r.std(ddof=1) * np.sqrt(252.0)) if r.std(ddof=1) != 0 else np.nan
+    active = r[r != 0]
+    hit = (active > 0).mean() * 100.0 if len(active) else np.nan
+    mdd = max_drawdown_from_aum(result.loc[r.index, "AUM"])
+
+    spy = spy_ret.reindex(r.index)
+    common = pd.concat([r.rename("strategy"), spy.rename("spy")], axis=1).dropna()
+    alpha = np.nan
+    beta = np.nan
+    if len(common) > 5 and common["spy"].std(ddof=1) != 0:
+        model = sm.OLS(common["strategy"], sm.add_constant(common["spy"])).fit()
+        alpha = model.params["const"] * 252.0 * 100.0
+        beta = model.params["spy"]
+
+    skewness = r.skew()
+    worst_day = r.min() * 100.0
+    best_day = r.max() * 100.0
+
+    return {
+        "Strategy": name,
+        "Stop": stop_label,
+        "Size": size_label,
+        "Total Return (%)": total_return,
+        "IRR (%)": irr,
+        "Vol (%)": vol,
+        "Sharpe Ratio": sharpe,
+        "Hit Ratio (%)": hit,
+        "MDD (%)": mdd,
+        "Alpha (%)": alpha,
+        "Beta": beta,
+        "Skewness": skewness,
+        "Worst Day (%)": worst_day,
+        "Best Day (%)": best_day,
+    }
+
+
+def trade_stats(name, stop_label, size_label, trades, n_days):
+    if trades is None or trades.empty:
+        return {
+            "Strategy": name, "Stop": stop_label, "Size": size_label,
+            "Trades": 0, "Avg. Trade x Day": 0.0, "Hit Ratio (%)": np.nan,
+            "Avg. PnL x Share ($)": np.nan, "Max Loss Trade (%)": np.nan,
+            "Max Loss Date": "", "Max Gain Trade (%)": np.nan, "Max Gain Date": "",
+        }
+
+    worst_idx = trades["Trade Return (%)"].idxmin()
+    best_idx = trades["Trade Return (%)"].idxmax()
+    worst = trades.loc[worst_idx]
+    best = trades.loc[best_idx]
+
+    return {
+        "Strategy": name,
+        "Stop": stop_label,
+        "Size": size_label,
+        "Trades": int(len(trades)),
+        "Avg. Trade x Day": len(trades) / n_days if n_days else np.nan,
+        "Hit Ratio (%)": (trades["Gross PnL / Share"] > 0).mean() * 100.0,
+        "Avg. PnL x Share ($)": trades["Gross PnL / Share"].mean(),
+        "Max Loss Trade (%)": worst["Trade Return (%)"],
+        "Max Loss Date": pd.Timestamp(worst["Day"]).strftime("%d-%b-%Y"),
+        "Max Gain Trade (%)": best["Trade Return (%)"],
+        "Max Gain Date": pd.Timestamp(best["Day"]).strftime("%d-%b-%Y"),
+    }
+
+def annual_returns(return_series):
+    s = return_series.dropna().copy()
+    idx = pd.to_datetime(s.index.astype(str))
+    s.index = idx
+    return ((1.0 + s).groupby(s.index.year).prod() - 1.0) * 100.0
+
+
+def monthly_table(return_series):
+    s = return_series.dropna().copy()
+    s.index = pd.to_datetime(s.index.astype(str))
+    monthly = ((1.0 + s).groupby([s.index.year, s.index.month]).prod() - 1.0) * 100.0
+    tbl = monthly.unstack(level=1)
+    tbl = tbl.reindex(columns=range(1, 13))
+    tbl.columns = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+    yearly = ((1.0 + s).groupby(s.index.year).prod() - 1.0) * 100.0
+    tbl["Yearly"] = yearly
+    tbl.index.name = "Year"
+    return tbl
+
+
+
+# ============================================================
+# 6. PAPER-STYLE REPORTING HELPERS
+# ============================================================
+
+def _strategy_label(row):
+    if row["Strategy"] == "SPY Buy&Hold":
+        return "SPY Buy & Hold"
+    if row["Strategy"] == "Maroy 2025":
+        return "Maroy VWAP #1\nPublished params"
+    if row["Strategy"] == "OWN v2 Adaptive Noise":
+        return "OWN v2 Adaptive Noise"
+    if row["Size"] == "Dynamic":
+        return "Curr.Band + VWAP\nDynamic"
+    return f"{row['Stop']}\n{row['Size']}"
+
+
+def save_table_png(df, path, title, font_size=8, scale_y=1.35, max_rows=None):
+    """Render a DataFrame as a readable PNG table for presentation/checking."""
+    show = df.copy()
+    if max_rows is not None and len(show) > max_rows:
+        show = show.head(max_rows)
+
+    def fmt(v):
+        if pd.isna(v):
+            return ""
+        if isinstance(v, (float, np.floating)):
+            return f"{v:,.2f}"
+        return str(v)
+
+    cell_text = [[fmt(v) for v in row] for row in show.to_numpy()]
+    col_labels = [str(c) for c in show.columns]
+    width = max(12, min(24, 1.25 * len(col_labels)))
+    height = max(3.4, min(15, 1.0 + 0.42 * (len(show) + 1)))
+
+    fig, ax = plt.subplots(figsize=(width, height))
+    ax.axis("off")
+    ax.set_title(title, fontsize=12, fontweight="bold", pad=14)
+    tbl = ax.table(cellText=cell_text, colLabels=col_labels, loc="center", cellLoc="center")
+    tbl.auto_set_font_size(False)
+    tbl.set_fontsize(font_size)
+    tbl.scale(1, scale_y)
+    for (r, c), cell in tbl.get_celld().items():
+        if r == 0:
+            cell.set_text_props(weight="bold")
+    fig.tight_layout()
+    fig.savefig(path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+
+
+def save_metric_bar(portfolio_summary, metric, path, title, ylabel):
+    labels = [_strategy_label(row) for _, row in portfolio_summary.iterrows()]
+    values = portfolio_summary[metric].astype(float).to_numpy()
+    fig, ax = plt.subplots(figsize=(10, 6))
+    bars = ax.bar(labels, values)
+    ax.axhline(0, linewidth=0.8)
+    ax.set_title(title, fontsize=14, fontweight="bold")
+    ax.set_ylabel(ylabel)
+    ax.grid(axis="y", linestyle="--", alpha=0.3)
+    ax.tick_params(axis="x", rotation=12)
+    for bar, value in zip(bars, values):
+        if np.isfinite(value):
+            ax.text(bar.get_x() + bar.get_width()/2, bar.get_height(), f"{value:.2f}",
+                    ha="center", va="bottom" if value >= 0 else "top", fontsize=9)
+    fig.tight_layout()
+    fig.savefig(path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+
+
+def drawdown_series(aum):
+    x = aum.astype(float).copy()
+    x = x.ffill()
+    running_max = x.cummax()
+    return (x / running_max - 1.0) * 100.0
+
+
+def rolling_sharpe(return_series, window=252):
+    s = return_series.astype(float).copy()
+    mu = s.rolling(window, min_periods=max(60, window // 2)).mean()
+    sd = s.rolling(window, min_periods=max(60, window // 2)).std(ddof=1)
+    return mu / sd * np.sqrt(252.0)
+
+
+def save_drawdown_chart(series_map, path):
+    fig, ax = plt.subplots(figsize=(13, 7))
+    for label, aum in series_map.items():
+        idx = pd.to_datetime(aum.index.astype(str))
+        ax.plot(idx, drawdown_series(aum).to_numpy(), label=label, linewidth=1.6)
+    ax.set_title("Drawdown Comparison", fontsize=14, fontweight="bold")
+    ax.set_ylabel("Drawdown (%)")
+    ax.set_xlabel("Date")
+    ax.grid(True, linestyle="--", alpha=0.3)
+    ax.legend(loc="lower left")
+    ax.xaxis.set_major_locator(mdates.YearLocator())
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
+    fig.tight_layout()
+    fig.savefig(path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+
+
+def save_rolling_sharpe_chart(return_map, path, window=252):
+    fig, ax = plt.subplots(figsize=(13, 7))
+    for label, s in return_map.items():
+        rs = rolling_sharpe(s, window=window)
+        idx = pd.to_datetime(rs.index.astype(str))
+        ax.plot(idx, rs.to_numpy(), label=label, linewidth=1.5)
+    ax.axhline(0, linewidth=0.8)
+    ax.set_title(f"Rolling {window}-Trading-Day Sharpe Ratio", fontsize=14, fontweight="bold")
+    ax.set_ylabel("Sharpe Ratio")
+    ax.set_xlabel("Date")
+    ax.grid(True, linestyle="--", alpha=0.3)
+    ax.legend(loc="best")
+    ax.xaxis.set_major_locator(mdates.YearLocator())
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
+    fig.tight_layout()
+    fig.savefig(path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+
+
+def save_annual_return_chart(annual, path):
+    cols = ["Opp.Band 1x", "Curr.Band + VWAP 1x", "Curr.Band + VWAP Dynamic"]
+    if "Maroy 2025 VWAP #1 adaptation" in annual.columns:
+        cols.append("Maroy 2025 VWAP #1 adaptation")
+    if "OWN v2 Adaptive Noise + Stop" in annual.columns:
+        cols.append("OWN v2 Adaptive Noise + Stop")
+    cols.extend([c for c in [M9_NAME,M12_NAME,MAROY_ML_NAME,MAROY_HMM_NAME,MAROY_ML_PARAM_NAME] if c in annual.columns and c not in cols])
+    if M9_NAME in annual.columns:
+        cols.append(M9_NAME)
+    cols.append("SPY Buy&Hold")
+    x = np.arange(len(annual.index))
+    width = min(0.18, 0.8 / max(len(cols), 1))
+    fig, ax = plt.subplots(figsize=(15, 7))
+    center = (len(cols) - 1) / 2.0
+    for j, col in enumerate(cols):
+        ax.bar(x + (j - center) * width, annual[col].to_numpy(dtype=float), width, label=col)
+    ax.axhline(0, linewidth=0.8)
+    ax.set_xticks(x)
+    ax.set_xticklabels([str(y) for y in annual.index])
+    ax.set_ylabel("Annual Return (%)")
+    ax.set_xlabel("Year")
+    ax.set_title("Annual Returns by Strategy", fontsize=14, fontweight="bold")
+    ax.grid(axis="y", linestyle="--", alpha=0.3)
+    ax.legend(loc="best")
+    fig.tight_layout()
+    fig.savefig(path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+
+
+def save_paper_overlap_chart(annual, path):
+    tmp = annual[["Curr.Band + VWAP Dynamic", "Paper Dynamic (reported)"]].dropna()
+    x = np.arange(len(tmp.index))
+    width = 0.36
+    fig, ax = plt.subplots(figsize=(12, 6))
+    ax.bar(x - width/2, tmp["Curr.Band + VWAP Dynamic"], width, label="Your Alpaca replication")
+    ax.bar(x + width/2, tmp["Paper Dynamic (reported)"], width, label="Paper reported")
+    ax.axhline(0, linewidth=0.8)
+    ax.set_xticks(x)
+    ax.set_xticklabels([str(y) for y in tmp.index])
+    ax.set_ylabel("Annual Return (%)")
+    ax.set_xlabel("Year")
+    ax.set_title("Dynamic Strategy: Your Replication vs Paper (Overlap Years)", fontsize=14, fontweight="bold")
+    ax.grid(axis="y", linestyle="--", alpha=0.3)
+    ax.legend(loc="best")
+    fig.tight_layout()
+    fig.savefig(path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+
+
+def save_monthly_heatmap(monthly, path):
+    values = monthly.to_numpy(dtype=float)
+    fig, ax = plt.subplots(figsize=(14, max(5, 0.55 * len(monthly))))
+    im = ax.imshow(values, aspect="auto")
+    ax.set_xticks(np.arange(len(monthly.columns)))
+    ax.set_xticklabels(monthly.columns)
+    ax.set_yticks(np.arange(len(monthly.index)))
+    ax.set_yticklabels(monthly.index.astype(str))
+    ax.set_title("Dynamic Current Band + VWAP - Monthly Returns (%)", fontsize=14, fontweight="bold")
+    for i in range(values.shape[0]):
+        for j in range(values.shape[1]):
+            v = values[i, j]
+            if np.isfinite(v):
+                ax.text(j, i, f"{v:.1f}", ha="center", va="center", fontsize=7)
+    fig.colorbar(im, ax=ax, label="Return (%)")
+    fig.tight_layout()
+    fig.savefig(path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+
+
+
+def save_equity_chart(series_map, path, title, subtitle=None):
+    fig, ax = plt.subplots(figsize=(14, 8))
+    for label, aum in series_map.items():
+        idx = pd.to_datetime(aum.index.astype(str))
+        ax.plot(idx, aum.astype(float).to_numpy(), label=label, linewidth=2.0)
+    ax.grid(True, linestyle="--", alpha=0.3)
+    ax.xaxis.set_major_locator(mdates.YearLocator())
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
+    ax.yaxis.set_major_formatter(FuncFormatter(lambda x, _: f"${x:,.0f}"))
+    ax.set_ylabel("Portfolio Value ($)")
+    ax.set_xlabel("Date")
+    ax.set_title(title, fontsize=15, fontweight="bold", pad=18)
+    ax.legend(loc="upper left", frameon=True)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    if subtitle:
+        fig.suptitle(subtitle, fontsize=9, y=0.02)
+    fig.tight_layout()
+    fig.savefig(path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+
+
+def save_trade_metric_bar(trade_summary, metric, path, title, ylabel):
+    labels = [f"{r['Stop']}\n{r['Size']}" for _, r in trade_summary.iterrows()]
+    values = pd.to_numeric(trade_summary[metric], errors="coerce").to_numpy(dtype=float)
+    fig, ax = plt.subplots(figsize=(9, 5.5))
+    bars = ax.bar(labels, values)
+    ax.axhline(0, linewidth=0.8)
+    ax.set_title(title, fontweight="bold")
+    ax.set_ylabel(ylabel)
+    ax.grid(axis="y", linestyle="--", alpha=0.3)
+    for b, v in zip(bars, values):
+        if np.isfinite(v):
+            ax.text(b.get_x()+b.get_width()/2, b.get_height(), f"{v:.2f}", ha="center", va="bottom" if v >= 0 else "top", fontsize=9)
+    fig.tight_layout()
+    fig.savefig(path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+
+
+def subset_portfolio_table(summary, rows):
+    return summary.iloc[rows].reset_index(drop=True)
+
+
+def stats_for_subset(r):
+    r = pd.Series(r).dropna().astype(float)
+    n = len(r)
+    if n == 0:
+        return {"Observations": 0, "Avg.PnL (bps)": np.nan, "t-stat": np.nan, "Hit Ratio (%)": np.nan, "Sharpe Ratio": np.nan}
+    sd = r.std(ddof=1)
+    tstat = r.mean() / (sd / np.sqrt(n)) if n > 1 and sd > 0 else np.nan
+    active = r[r != 0]
+    hit = (active > 0).mean() * 100 if len(active) else np.nan
+    sharpe = r.mean() / sd * np.sqrt(252) if sd > 0 else np.nan
+    return {"Observations": n, "Avg.PnL (bps)": r.mean()*10000, "t-stat": tstat, "Hit Ratio (%)": hit, "Sharpe Ratio": sharpe}
+
+
+def day_of_week_table(dynamic_returns):
+    s = dynamic_returns.dropna().copy()
+    s.index = pd.to_datetime(s.index.astype(str))
+    rows = []
+    base = stats_for_subset(s)
+    rows.append({"Day": "Unconditional", **base})
+    for name in ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]:
+        st = stats_for_subset(s[s.index.day_name() == name])
+        rows.append({"Day": name, **st})
+    return pd.DataFrame(rows)
+
+
+def daily_patterns_table(daily, dynamic_returns):
+    # Paper-style pattern definitions. Patterns are formed on day t-1 and used to condition strategy return on day t.
+    d = daily[["open", "high", "low", "close"]].copy().astype(float)
+    d.index = pd.to_datetime(pd.Index(d.index.astype(str)))
+    rng = d["high"] - d["low"]
+    safe_rng = rng.replace(0, np.nan)
+    open_loc = (d["open"] - d["low"]) / safe_rng
+    close_loc = (d["close"] - d["low"]) / safe_rng
+    avg_range14 = rng.shift(1).rolling(14, min_periods=14).mean()
+
+    patterns = pd.DataFrame(index=d.index)
+    patterns["NR4"] = rng.eq(rng.rolling(4, min_periods=4).min())
+    patterns["NR7"] = rng.eq(rng.rolling(7, min_periods=7).min())
+    patterns["ID"] = (d["high"] < d["high"].shift(1)) & (d["low"] > d["low"].shift(1))
+    patterns["OD"] = (d["high"] > d["high"].shift(1)) & (d["low"] < d["low"].shift(1))
+    patterns["Triangle"] = (d["high"] < pd.concat([d["high"].shift(1), d["high"].shift(2)], axis=1).min(axis=1)) & (d["low"] > pd.concat([d["low"].shift(1), d["low"].shift(2)], axis=1).max(axis=1))
+    bullish_trend = (open_loc <= 0.15) & (close_loc >= 0.85)
+    bearish_trend = (open_loc >= 0.85) & (close_loc <= 0.15)
+    patterns["Trend"] = (bullish_trend | bearish_trend) & (rng > avg_range14)
+    patterns["Big Tail"] = ((open_loc >= 0.75) & (close_loc >= 0.75)) | ((open_loc <= 0.25) & (close_loc <= 0.25))
+    patterns["Strong/Weak Closure"] = (close_loc >= 0.90) | (close_loc <= 0.10)
+
+    # Shift one day: the completed daily pattern is known before the next trading session.
+    patterns = patterns.shift(1).fillna(False)
+    r = dynamic_returns.copy()
+    r.index = pd.to_datetime(pd.Index(r.index.astype(str)))
+    r = r.reindex(patterns.index)
+
+    rows = [{"Daily Pattern": "Unconditional", **stats_for_subset(r.dropna())}]
+    for col in patterns.columns:
+        rows.append({"Daily Pattern": col, **stats_for_subset(r[patterns[col]].dropna())})
+    return pd.DataFrame(rows)
+
+
+def rsi_wilder(close, period=5):
+    close = pd.Series(close).astype(float)
+    delta = close.diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    avg_gain = gain.ewm(alpha=1/period, adjust=False, min_periods=period).mean()
+    avg_loss = loss.ewm(alpha=1/period, adjust=False, min_periods=period).mean()
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+    return 100 - 100/(1+rs)
+
+
+def gamma_rsi_regression(daily, dynamic_returns):
+    d = daily[["close"]].copy()
+    d.index = pd.to_datetime(pd.Index(d.index.astype(str)))
+    d["RSI5"] = rsi_wilder(d["close"], 5)
+    r = dynamic_returns.copy()
+    r.index = pd.to_datetime(pd.Index(r.index.astype(str)))
+    tmp = pd.concat([r.rename("ret"), d["RSI5"].shift(1).rename("RSI5_prev")], axis=1).dropna()
+    if len(tmp) < 10:
+        return pd.DataFrame(), None
+    y = tmp["ret"] * 10000  # bps, as in paper discussion
+    X = sm.add_constant(tmp["RSI5_prev"])
+    model = sm.OLS(y, X).fit()
+    out = pd.DataFrame([{ 
+        "Observations": int(model.nobs),
+        "Alpha (bps)": model.params.get("const", np.nan),
+        "Beta RSI5": model.params.get("RSI5_prev", np.nan),
+        "Beta p-value": model.pvalues.get("RSI5_prev", np.nan),
+        "R-squared": model.rsquared,
+    }])
+    return out, (tmp, model)
+
+
+def save_rsi_regression_figure(regression_payload, path):
+    if regression_payload is None:
+        return
+    tmp, model = regression_payload
+    x = tmp["RSI5_prev"].to_numpy(dtype=float)
+    y = (tmp["ret"]*10000).to_numpy(dtype=float)
+    order = np.argsort(x)
+    yhat = model.params["const"] + model.params["RSI5_prev"] * x
+    fig, ax = plt.subplots(figsize=(9, 6))
+    ax.scatter(x, y, s=10, alpha=0.25)
+    ax.plot(x[order], yhat[order], linewidth=2)
+    ax.axhline(0, linewidth=0.8)
+    ax.set_xlabel("Previous-day SPY RSI(5)")
+    ax.set_ylabel("Dynamic strategy return (bps)")
+    ax.set_title("RSI(5) proxy for dealer gamma imbalance", fontweight="bold")
+    ax.grid(True, linestyle="--", alpha=0.25)
+    fig.tight_layout()
+    fig.savefig(path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+
+
+def load_optional_vix():
+    candidates = [Path.home()/"Downloads"/"VIX_History.csv", Path.home()/"Downloads"/"VIX.xlsx", Path.home()/"Downloads"/"VIX.csv", Path.home()/"Downloads"/"vix.xlsx", Path.home()/"Downloads"/"vix.csv"]
+    for p in candidates:
+        if not p.exists():
+            continue
+        try:
+            raw = pd.read_excel(p) if p.suffix.lower() == ".xlsx" else pd.read_csv(p)
+            cols = {str(c).strip().upper(): c for c in raw.columns}
+            if "DATE" in cols and "OPEN" in cols:
+                out = raw[[cols["DATE"], cols["OPEN"]]].copy()
+                out.columns = ["Date", "VIX_Open"]
+            elif raw.shape[1] >= 1:
+                lines = raw.iloc[:,0].astype(str)
+                rows = [x.split(",") for x in lines]
+                if rows and rows[0][0].strip().upper() == "DATE":
+                    header = [z.strip().upper() for z in rows[0]]
+                    vals = pd.DataFrame(rows[1:], columns=header)
+                else:
+                    # Header may have been interpreted as the Excel column name.
+                    header = [z.strip().upper() for z in str(raw.columns[0]).split(",")]
+                    vals = pd.DataFrame(rows, columns=header)
+                out = vals[["DATE", "OPEN"]].copy()
+                out.columns = ["Date", "VIX_Open"]
+            else:
+                continue
+            out["Date"] = pd.to_datetime(out["Date"], errors="coerce").dt.date
+            out["VIX_Open"] = pd.to_numeric(out["VIX_Open"], errors="coerce")
+            out = out.dropna().drop_duplicates("Date")
+            print(f"Loaded optional VIX data from: {p}")
+            return out
+        except Exception as e:
+            print(f"Could not parse optional VIX file {p}: {e}")
+    return None
+
+
+def vix_regime_table(dynamic_returns, vix):
+    if vix is None or vix.empty:
+        return pd.DataFrame()
+    r = dynamic_returns.dropna().copy()
+    base = pd.DataFrame({"Day": r.index, "ret": r.values})
+    base["Day"] = pd.to_datetime(base["Day"].astype(str)).dt.date
+    base = base.merge(vix.rename(columns={"Date":"Day"}), on="Day", how="inner")
+    rows=[]
+    for th in VIX_THRESHOLDS:
+        s = base.loc[base["VIX_Open"] > th, "ret"]
+        st = stats_for_subset(s)
+        rows.append({"VIX Open >": th, **st})
+    return pd.DataFrame(rows)
+
+
+def save_vix_figure(tbl, path):
+    if tbl.empty:
+        return
+    fig, ax = plt.subplots(figsize=(10, 6))
+    ax.bar(tbl["VIX Open >"].astype(str), tbl["Sharpe Ratio"])
+    ax.set_xlabel("VIX open threshold")
+    ax.set_ylabel("Sharpe Ratio")
+    ax.set_title("Sharpe Ratio by VIX-at-open regime", fontweight="bold")
+    ax.grid(axis="y", linestyle="--", alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+
+
+def save_sensitivity_figure(tbl, xcol, ycol, path, title, ylabel):
+    fig, ax = plt.subplots(figsize=(9, 5.5))
+    ax.plot(tbl[xcol], tbl[ycol], marker="o")
+    ax.set_xlabel(xcol)
+    ax.set_ylabel(ylabel)
+    ax.set_title(title, fontweight="bold")
+    ax.grid(True, linestyle="--", alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+
+
+def save_example_day(df, day, path, use_vwap=False):
+    groups = df.groupby("day")
+    target = pd.Timestamp(day).date()
+    days = list(sorted(groups.groups.keys()))
+    if target not in groups.groups:
+        return
+    i = days.index(target)
+    if i == 0:
+        return
+    current = groups.get_group(target)
+    prev = groups.get_group(days[i-1])
+    prev_close_adj = prev["close"].iloc[-1] - current["dividend"].iloc[0]
+    op = current["open"].iloc[0]
+    ub = max(op, prev_close_adj)*(1+BAND_MULT*current["sigma_open"])
+    lb = min(op, prev_close_adj)*(1-BAND_MULT*current["sigma_open"])
+    fig, ax = plt.subplots(figsize=(12, 6))
+    ax.plot(current.index, current["close"], label="SPY Close", linewidth=1.5)
+    ax.plot(current.index, ub, label="Upper Band", linewidth=1.2)
+    ax.plot(current.index, lb, label="Lower Band", linewidth=1.2)
+    if use_vwap:
+        ax.plot(current.index, current["vwap"], label="VWAP", linewidth=1.2)
+        title = f"Current Band + VWAP stop example — {target}"
+    else:
+        title = f"Opposite-band stop example — {target}"
+    ax.fill_between(current.index, lb.to_numpy(), ub.to_numpy(), alpha=0.08)
+    ax.set_title(title, fontweight="bold")
+    ax.set_ylabel("SPY Price")
+    ax.grid(True, linestyle="--", alpha=0.25)
+    ax.legend(loc="best")
+    fig.tight_layout()
+    fig.savefig(path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+
+
+# ============================================================
+# 6. MAIN BACKTEST
+# ============================================================
+
+def main():
+    spy_intra_data, spy_daily_data, dividends = load_or_download_data()
+    df, daily, all_days = prepare_features(spy_intra_data, spy_daily_data, dividends)
+
+    print("\nRunning retained paper strategy variants...")
+    opp, opp_trades = run_strategy(df, daily, all_days, "Momentum Opp.Band 1x", "opposite_band", "full_notional")
+    curr, curr_trades = run_strategy(df, daily, all_days, "Momentum Curr.Band + VWAP 1x", "current_band_vwap", "full_notional")
+    dyn, dyn_trades = run_strategy(df, daily, all_days, "Momentum Curr.Band + VWAP Dynamic", "current_band_vwap", "vol_target")
+
+    print("\nRunning OWN v2 Adaptive Noise + Adaptive Stop...")
+    own2_threshold, own2_tuning, own2_result, own2_trades = choose_adaptive_noise_threshold(df, daily, all_days)
+    print(f"Selected OWN v2 regime-score threshold from VALIDATION ONLY: q_regime = {own2_threshold:.2f}")
+
+    print("\nRunning Maroy (2025) VWAP #1 published-parameter adaptation on SPY...")
+    maroy_prepared = prepare_maroy_features(df, daily)
+    maroy, maroy_trades = run_maroy_vwap1_strategy(df, daily, all_days, prepared=maroy_prepared)
+
+    # VIX is optional and used only for paper-style regime analysis, not for trading.
+    vix = load_optional_vix()
+    if vix is not None and not vix.empty:
+        print(f"VIX coverage: {min(vix['Date'])} to {max(vix['Date'])} | {len(vix):,} observations")
+
+    print("\nTraining and running M9 BiLSTM q10/q90 bounds...")
+    m9_result, m9_trades = run_m9_bilstm_strategy(df, daily, all_days, vix=vix)
+
+    print("\nRunning M12 inverse-variance strategy...")
+    m12_result, m12_trades = run_m12_inverse_variance_strategy(df, daily, all_days)
+    print("\nRunning monthly Maroy parameter selection and HMM regime version...")
+    maroy_candidates = {}
+    for profile in MAROY_PARAMETER_CANDIDATES:
+        cres, _ = run_maroy_vwap1_strategy(df,daily,all_days,params=profile,
+            strategy_name=f"Maroy candidate {profile['name']}",prepared=maroy_prepared)
+        maroy_candidates[profile["name"]]=cres
+    ml_schedule,maroy_ml_selection=build_monthly_maroy_schedule(maroy_candidates,all_days)
+    maroy_ml,maroy_ml_trades=run_maroy_vwap1_strategy(df,daily,all_days,strategy_name=MAROY_ML_NAME,
+        parameter_schedule=ml_schedule,prepared=maroy_prepared)
+    ml_param_schedule,maroy_ml_param_selection=build_maroy_ml_parameter_schedule(
+        df,daily,all_days,maroy_candidates,vix,ml_schedule)
+    maroy_ml_param,maroy_ml_param_trades=run_maroy_vwap1_strategy(
+        df,daily,all_days,strategy_name=MAROY_ML_PARAM_NAME,
+        parameter_schedule=ml_param_schedule,prepared=maroy_prepared)
+    hmm_schedule,maroy_hmm_selection=build_maroy_hmm_schedule(df,daily,all_days,maroy_candidates,vix)
+    maroy_hmm,maroy_hmm_trades=run_maroy_vwap1_strategy(df,daily,all_days,strategy_name=MAROY_HMM_NAME,
+        parameter_schedule=hmm_schedule,prepared=maroy_prepared)
+
+    spy_ret = daily["ret"].reindex(all_days)
+    spy_aum = AUM_0 * (1.0 + spy_ret.fillna(0.0)).cumprod()
+    valid_days = dyn["ret"].dropna().index
+    n_backtest_days = len(valid_days)
+
+    portfolio_summary = pd.DataFrame([
+        portfolio_stats("Momentum", "Opp.Band", "100%", opp, spy_ret),
+        portfolio_stats("Momentum", "Curr.Band + VWAP", "100%", curr, spy_ret),
+        portfolio_stats("Momentum", "Curr.Band + VWAP", "Dynamic", dyn, spy_ret),
+    ])
+
+    spy_common = spy_ret.reindex(valid_days).dropna()
+    spy_total = ((1 + spy_common).prod() - 1) * 100
+    spy_irr = ((1 + spy_common).prod() ** (252 / len(spy_common)) - 1) * 100
+    spy_vol = spy_common.std(ddof=1) * np.sqrt(252) * 100
+    spy_sharpe = spy_common.mean() / spy_common.std(ddof=1) * np.sqrt(252)
+    spy_active = spy_common[spy_common != 0]
+    spy_hit = (spy_active > 0).mean() * 100
+    spy_curve_common = AUM_0 * (1 + spy_common).cumprod()
+    spy_mdd = max_drawdown_from_aum(spy_curve_common)
+
+    portfolio_summary = pd.concat([
+        portfolio_summary,
+        pd.DataFrame([{
+            "Strategy": "SPY Buy&Hold", "Stop": "-", "Size": "100%",
+            "Total Return (%)": spy_total, "IRR (%)": spy_irr, "Vol (%)": spy_vol,
+            "Sharpe Ratio": spy_sharpe, "Hit Ratio (%)": spy_hit, "MDD (%)": spy_mdd,
+            "Alpha (%)": 0.0, "Beta": 1.0, "Skewness": spy_common.skew(),
+            "Worst Day (%)": spy_common.min() * 100.0, "Best Day (%)": spy_common.max() * 100.0,
+        }]),
+        pd.DataFrame([
+            portfolio_stats("Maroy 2025", "VWAP only", "Published params", maroy, spy_ret),
+            portfolio_stats("OWN v2 Adaptive Noise", "Adaptive band + stop", f"q_regime={own2_threshold:.2f}", own2_result, spy_ret),
+            portfolio_stats("M9 BiLSTM q10/q90", "Asymmetric q10/q90 + VWAP", "Dynamic", m9_result, spy_ret),
+            portfolio_stats(M12_NAME, "Current band + VWAP", "Inverse variance", m12_result, spy_ret),
+            portfolio_stats(MAROY_ML_NAME, "VWAP touch + time exit", "Monthly validation", maroy_ml, spy_ret),
+            portfolio_stats(MAROY_HMM_NAME, "VWAP touch + time exit", "HMM + VIX/RV", maroy_hmm, spy_ret),
+            portfolio_stats(MAROY_ML_PARAM_NAME, "VWAP touch + time exit", "Walk-forward Random Forest", maroy_ml_param, spy_ret),
+        ])
+    ], ignore_index=True)
+
+    trade_summary = pd.DataFrame([
+        trade_stats("Intra Mom.", "Opp.Band", "100%", opp_trades, n_backtest_days),
+        trade_stats("Intra Mom.", "Curr.Band + VWAP", "100%", curr_trades, n_backtest_days),
+        trade_stats("Intra Mom.", "Curr.Band + VWAP", "Dynamic", dyn_trades, n_backtest_days),
+        trade_stats("Maroy 2025", "VWAP only", "Published params", maroy_trades, n_backtest_days),
+        trade_stats("OWN v2 Adaptive Noise", "Adaptive band + adaptive stop", f"q_regime={own2_threshold:.2f}", own2_trades, n_backtest_days),
+        trade_stats("M9 BiLSTM q10/q90", "Asymmetric q10/q90 + VWAP", "Dynamic", m9_trades, n_backtest_days),
+        trade_stats(M12_NAME, "Current band + VWAP", "Inverse variance", m12_trades, n_backtest_days),
+        trade_stats(MAROY_ML_NAME, "VWAP touch + time exit", "Monthly validation", maroy_ml_trades, n_backtest_days),
+        trade_stats(MAROY_HMM_NAME, "VWAP touch + time exit", "HMM + VIX/RV", maroy_hmm_trades, n_backtest_days),
+        trade_stats(MAROY_ML_PARAM_NAME, "VWAP touch + time exit", "Walk-forward Random Forest", maroy_ml_param_trades, n_backtest_days),
+    ])
+
+    paper_benchmark = pd.DataFrame([
+        ["Momentum", "Opp.Band", "100%", 178.0, 6.2, 10.9, 0.61, 54.0, 21.0, 7.1, -0.05, -1.24, -10.3, 6.1],
+        ["Momentum", "Curr.Band + VWAP", "100%", 380.0, 9.7, 7.7, 1.24, 43.0, 12.0, 9.9, -0.03, 1.29, -4.8, 5.1],
+        ["Momentum", "Curr.Band + VWAP", "Dynamic", 1985.0, 19.6, 14.3, 1.33, 43.0, 25.0, 19.6, -0.07, 1.22, -4.5, 9.1],
+        ["SPY Buy&Hold", "-", "100%", 227.0, 7.2, 20.2, 0.45, 54.0, 56.0, np.nan, 1.0, 0.08, -10.9, 14.5],
+    ], columns=portfolio_summary.columns)
+
+    paper_trade_benchmark = pd.DataFrame([
+        ["Intra Mom.", "Opp.Band", "100%", 5494, 1.3, 53.0, 0.10, -8.6, "13-Nov-2008", 6.0, "13-Oct-2008"],
+        ["Intra Mom.", "Curr.Band + VWAP", "100%", 7668, 1.8, 37.0, 0.09, -4.0, "18-Mar-2020", 4.6, "15-Oct-2008"],
+        ["Intra Mom.", "Curr.Band + VWAP", "Dynamic", 7668, 1.8, 37.0, 0.09, -2.9, "31-Jul-2013", 9.1, "10-Oct-2018"],
+    ], columns=trade_summary.columns)
+
+    maroy_reported = pd.DataFrame([{
+        "Strategy": "VWAP #1", "Reported Sharpe": 3.16, "Reported Alpha (%)": 39.0,
+        "Reported Beta (%)": 1.0, "Reported Annual Return (%)": 58.0,
+        "Reported Annual Volatility (%)": 18.0, "Reported MDD (%)": 15.0,
+        "Reported MDD Period (days)": 107,
+        "Source Sample": "QQQ, 2014-10-01 to 2024-10-01, 1-second bars",
+    }])
+    maroy_parameters = pd.DataFrame([{
+        "Strategy": "VWAP #1", "lookback_days": MAROY_LOOKBACK_DAYS,
+        "volatility_multiplier_enter": MAROY_VOL_MULT_ENTER,
+        "target_daily_volatility": MAROY_TARGET_VOL,
+        "start_trade_after_open_minutes": MAROY_START_AFTER_OPEN_MIN,
+        "trade_frequency_minutes": MAROY_TRADE_FREQ_MIN,
+        "exit_trades_before_close_minutes": MAROY_EXIT_BEFORE_CLOSE_MIN,
+        "Exit rule": "VWAP touch + fixed time exit",
+    }])
+
+    annual = pd.concat([
+        annual_returns(opp["ret"]).rename("Opp.Band 1x"),
+        annual_returns(curr["ret"]).rename("Curr.Band + VWAP 1x"),
+        annual_returns(dyn["ret"]).rename("Curr.Band + VWAP Dynamic"),
+        annual_returns(maroy["ret"]).rename("Maroy 2025 VWAP #1 adaptation"),
+        annual_returns(own2_result["ret"]).rename("OWN v2 Adaptive Noise + Stop"),
+        annual_returns(m9_result["ret"]).rename(M9_NAME),
+        annual_returns(m12_result["ret"]).rename(M12_NAME),
+        annual_returns(maroy_ml["ret"]).rename(MAROY_ML_NAME),
+        annual_returns(maroy_hmm["ret"]).rename(MAROY_HMM_NAME),
+        annual_returns(maroy_ml_param["ret"]).rename(MAROY_ML_PARAM_NAME),
+        annual_returns(spy_ret).rename("SPY Buy&Hold"),
+    ], axis=1)
+    paper_dynamic_annual = {2016:-12.8, 2017:-6.9, 2018:61.1, 2019:6.9, 2020:26.8, 2021:34.8, 2022:24.4, 2023:37.2, 2024:32.2}
+    annual["Paper Dynamic (reported)"] = pd.Series(paper_dynamic_annual)
+    annual["Dynamic vs Paper (pp)"] = annual["Curr.Band + VWAP Dynamic"] - annual["Paper Dynamic (reported)"]
+    annual.index.name = "Year"
+
+    monthly_dynamic = monthly_table(dyn["ret"])
+    monthly_maroy = monthly_table(maroy["ret"])
+    monthly_own2 = monthly_table(own2_result["ret"])
+    monthly_m9 = monthly_table(m9_result["ret"])
+    monthly_m12 = monthly_table(m12_result["ret"])
+    monthly_maroy_ml = monthly_table(maroy_ml["ret"])
+    monthly_maroy_hmm = monthly_table(maroy_hmm["ret"])
+    monthly_maroy_ml_param = monthly_table(maroy_ml_param["ret"])
+    globals()["_SPLIT_RESULTS"]={M12_NAME:m12_result,MAROY_ML_NAME:maroy_ml,MAROY_HMM_NAME:maroy_hmm,MAROY_ML_PARAM_NAME:maroy_ml_param}
+    split_comparison = split_comparison_table(dyn, maroy, own2_result, m9_result)
+
+    daily_audit = pd.DataFrame(index=all_days)
+    daily_audit.index.name = "Day"
+    daily_audit["OppBand_Return"] = opp["ret"]; daily_audit["OppBand_AUM"] = opp["AUM"]
+    daily_audit["CurrVWAP1x_Return"] = curr["ret"]; daily_audit["CurrVWAP1x_AUM"] = curr["AUM"]
+    daily_audit["Dynamic_Return"] = dyn["ret"]; daily_audit["Dynamic_AUM"] = dyn["AUM"]
+    daily_audit["Dynamic_Leverage"] = dyn["leverage"]; daily_audit["Dynamic_Shares"] = dyn["shares"]
+    daily_audit["Maroy_Return"] = maroy["ret"]; daily_audit["Maroy_AUM"] = maroy["AUM"]
+    daily_audit["Maroy_Leverage"] = maroy["leverage"]
+    daily_audit["Own2_Return"] = own2_result["ret"]; daily_audit["Own2_AUM"] = own2_result["AUM"]
+    daily_audit["Own2_Leverage"] = own2_result["leverage"]; daily_audit["Own2_RegimeThreshold"] = own2_threshold
+    daily_audit["M9_BiLSTM_Return"] = m9_result["ret"]; daily_audit["M9_BiLSTM_AUM"] = m9_result["AUM"]
+    daily_audit["M9_BiLSTM_Leverage"] = m9_result["leverage"]
+    daily_audit["M12_Return"] = m12_result["ret"]; daily_audit["M12_AUM"] = m12_result["AUM"]
+    daily_audit["M12_Leverage"] = m12_result["leverage"]
+    daily_audit["Maroy_Monthly_Return"] = maroy_ml["ret"]; daily_audit["Maroy_Monthly_AUM"] = maroy_ml["AUM"]
+    daily_audit["Maroy_Monthly_Profile"] = maroy_ml["selected_profile"]
+    daily_audit["Maroy_HMM_Return"] = maroy_hmm["ret"]; daily_audit["Maroy_HMM_AUM"] = maroy_hmm["AUM"]
+    daily_audit["Maroy_HMM_Profile"] = maroy_hmm["selected_profile"]
+    daily_audit["Maroy_ML_Param_Return"] = maroy_ml_param["ret"]; daily_audit["Maroy_ML_Param_AUM"] = maroy_ml_param["AUM"]
+    daily_audit["Maroy_ML_Param_Profile"] = maroy_ml_param["selected_profile"]
+    daily_audit["SPY_Return"] = spy_ret; daily_audit["SPY_AUM"] = spy_aum
+
+    all_trades = pd.concat([opp_trades, curr_trades, dyn_trades, maroy_trades, own2_trades, m9_trades, m12_trades, maroy_ml_trades, maroy_hmm_trades,maroy_ml_param_trades], ignore_index=True)
+
+    # Main comparison graph.
+    fig, ax = plt.subplots(figsize=(14, 8))
+    ax.plot(pd.to_datetime(opp.index.astype(str)), opp["AUM"], label="Momentum - Opp.Band - 1x", linewidth=1.7)
+    ax.plot(pd.to_datetime(curr.index.astype(str)), curr["AUM"], label="Momentum - Curr.Band + VWAP - 1x", linewidth=1.7)
+    ax.plot(pd.to_datetime(dyn.index.astype(str)), dyn["AUM"], label="Momentum - Curr.Band + VWAP - Dynamic", linewidth=2.4)
+    ax.plot(pd.to_datetime(maroy.index.astype(str)), maroy["AUM"], label="Maroy 2025 - VWAP #1 published params -> SPY", linewidth=2.0)
+    ax.plot(pd.to_datetime(own2_result.index.astype(str)), own2_result["AUM"], label=f"OWN v2 - Adaptive Noise + Stop (q={own2_threshold:.2f})", linewidth=2.6)
+    ax.plot(pd.to_datetime(m9_result.index.astype(str)), m9_result["AUM"], label="M9 BiLSTM q10/q90", linewidth=2.2, color="tab:cyan")
+    ax.plot(pd.to_datetime(m12_result.index.astype(str)),m12_result["AUM"],label=M12_NAME,linewidth=2.0,color="tab:pink")
+    ax.plot(pd.to_datetime(maroy_ml.index.astype(str)),maroy_ml["AUM"],label=MAROY_ML_NAME,linewidth=2.0,color="tab:olive")
+    ax.plot(pd.to_datetime(maroy_hmm.index.astype(str)),maroy_hmm["AUM"],label=MAROY_HMM_NAME,linewidth=2.0,color="tab:gray")
+    ax.plot(pd.to_datetime(maroy_ml_param.index.astype(str)),maroy_ml_param["AUM"],label=MAROY_ML_PARAM_NAME,linewidth=2.0,color="#d4a017")
+    ax.plot(pd.to_datetime(spy_aum.index.astype(str)), spy_aum, label="SPY Buy & Hold", linewidth=1.8,color="tab:brown")
+    ax.axvline(pd.Timestamp(SPLIT_VALIDATION_START), linestyle=":", linewidth=1.2, alpha=0.7)
+    ax.axvline(pd.Timestamp(SPLIT_TEST_START), linestyle=":", linewidth=1.2, alpha=0.7)
+    ymax = ax.get_ylim()[1]
+    ax.text(pd.Timestamp("2018-06-01"), ymax*0.96, "TRAIN", ha="center", va="top", fontsize=9)
+    ax.text(pd.Timestamp("2021-07-01"), ymax*0.96, "VALIDATION", ha="center", va="top", fontsize=9)
+    ax.text(pd.Timestamp("2024-06-01"), ymax*0.96, "TEST", ha="center", va="top", fontsize=9)
+    ax.grid(True, linestyle="--", alpha=0.3)
+    ax.xaxis.set_major_locator(mdates.YearLocator()); ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
+    ax.yaxis.set_major_formatter(FuncFormatter(lambda x, _: f"${x:,.0f}"))
+    ax.set_ylabel("Portfolio Value ($)"); ax.set_xlabel("Date")
+    ax.set_title("SPY Intraday Momentum Strategy Variants - Paper Comparison", fontsize=15, fontweight="bold", pad=18)
+    ax.legend(loc="upper left", frameon=True)
+    fig.suptitle(f"Alpaca SIP | {FROM_DATE} to {UNTIL_DATE} | Commission ${COMMISSION_PER_SHARE}/share | Slippage ${SLIPPAGE_PER_SHARE}/share", fontsize=10, y=0.02, color="gray")
+    ax.spines["top"].set_visible(False); ax.spines["right"].set_visible(False)
+    plt.tight_layout(); plt.subplots_adjust(bottom=0.10, top=0.92)
+    graph_path = FIGURE_DIR / "Figure_7_All_Strategies_Equity_Curve.png"
+    plt.savefig(graph_path, dpi=180, bbox_inches="tight"); plt.close(fig)
+
+    pd.set_option("display.max_columns", None); pd.set_option("display.width", 220)
+    pd.set_option("display.float_format", lambda x: f"{x:,.2f}")
+    for title, table in [
+        ("TABLE 1 - PORTFOLIO SUMMARY (YOUR ALPACA BACKTEST)", portfolio_summary),
+        ("TABLE 2 - PAPER REPORTED SUMMARY (2007-2024)", paper_benchmark),
+        ("TABLE 3 - TRADE-LEVEL SUMMARY (YOUR ALPACA BACKTEST)", trade_summary),
+        ("TABLE 4 - PAPER REPORTED TRADE SUMMARY", paper_trade_benchmark),
+        ("TABLE 5 - ANNUAL RETURNS (%)", annual),
+        ("TABLE 6 - MONTHLY RETURNS: DYNAMIC CURRENT BAND + VWAP (%)", monthly_dynamic),
+        ("TASK 3 - BASELINE + MAROY + OWN v2: TRAIN / VALIDATION / TEST", split_comparison),
+        (f"TASK 3 - OWN v2 VALIDATION TUNING (chosen q_regime={own2_threshold:.2f})", own2_tuning),
+    ]:
+        print("\n" + "="*120); print(title); print("="*120); print(table.to_string(index=False) if isinstance(table.index, pd.RangeIndex) else table.to_string())
+    print("\n" + "="*120); print("MAROY (2025) - REPORTED VWAP #1 BENCHMARK / PUBLISHED PARAMETERS"); print("="*120)
+    print(maroy_reported.to_string(index=False)); print(maroy_parameters.to_string(index=False))
+
+    compare_cols = ["Total Return (%)","IRR (%)","Vol (%)","Sharpe Ratio","Hit Ratio (%)","MDD (%)","Alpha (%)","Beta","Skewness","Worst Day (%)","Best Day (%)"]
+    yours_cmp = portfolio_summary.set_index(["Strategy","Stop","Size"])[compare_cols]
+    paper_cmp = paper_benchmark.set_index(["Strategy","Stop","Size"])[compare_cols]
+    paper_vs_yours = pd.concat({"Your Alpaca Backtest": yours_cmp, "Paper Reported": paper_cmp}, axis=1)
+    trade_key=["Strategy","Stop","Size"]
+    trade_paper_vs_yours = pd.concat({"Your Alpaca Backtest": trade_summary.set_index(trade_key), "Paper Reported": paper_trade_benchmark.set_index(trade_key)}, axis=1)
+
+    save_table_png(portfolio_summary, TABLE_DIR/"Table_3_Portfolio_Summary_Your_Backtest.png", "Summary statistics - Your Alpaca backtest", font_size=7, scale_y=1.45)
+    save_table_png(paper_benchmark, TABLE_DIR/"Table_3_Portfolio_Summary_Paper_Benchmark.png", "Paper reported summary statistics (2007-2024)", font_size=7, scale_y=1.45)
+    save_table_png(trade_summary, TABLE_DIR/"Table_4_Trade_Level_Summary_Your_Backtest.png", "Trade-level summary statistics - Your Alpaca backtest", font_size=7, scale_y=1.45)
+    save_table_png(paper_trade_benchmark, TABLE_DIR/"Table_4_Trade_Level_Summary_Paper_Benchmark.png", "Paper reported trade-level summary statistics", font_size=7, scale_y=1.45)
+    save_table_png(maroy_reported, TABLE_DIR/"Maroy_2025_Reported_VWAP1_Benchmark.png", "Maroy (2025) reported VWAP #1 benchmark (QQQ)", font_size=8, scale_y=1.4)
+    save_table_png(maroy_parameters, TABLE_DIR/"Maroy_2025_VWAP1_Published_Parameters.png", "Maroy (2025) VWAP #1 published parameters", font_size=8, scale_y=1.4)
+    save_table_png(annual.reset_index(), TABLE_DIR/"Table_Annual_Returns.png", "Annual returns (%)", font_size=7, scale_y=1.35)
+    save_table_png(monthly_dynamic.reset_index(), TABLE_DIR/"Table_Monthly_Returns_Dynamic.png", "Monthly returns (%) - Dynamic Current Band + VWAP", font_size=7, scale_y=1.35)
+
+    for metric, fname, title, ylabel in [
+        ("Sharpe Ratio","Figure_Sharpe_Ratio.png","Sharpe Ratio by Strategy","Sharpe Ratio"),
+        ("IRR (%)","Figure_Annualized_Return.png","Annualized Return by Strategy","Annualized Return (%)"),
+        ("Vol (%)","Figure_Annualized_Volatility.png","Annualized Volatility by Strategy","Annualized Volatility (%)"),
+        ("MDD (%)","Figure_Max_Drawdown.png","Maximum Drawdown by Strategy","Maximum Drawdown (%)"),
+    ]:
+        save_metric_bar(portfolio_summary, metric, FIGURE_DIR/fname, title, ylabel)
+
+    series_aum = {
+        "Opp.Band 1x":opp["AUM"], "Curr.Band + VWAP 1x":curr["AUM"], "Curr.Band + VWAP Dynamic":dyn["AUM"],
+        "Maroy 2025 VWAP #1":maroy["AUM"], "OWN v2 Adaptive Noise + Stop":own2_result["AUM"], M9_NAME:m9_result["AUM"],
+        M12_NAME:m12_result["AUM"],MAROY_ML_NAME:maroy_ml["AUM"],MAROY_HMM_NAME:maroy_hmm["AUM"],MAROY_ML_PARAM_NAME:maroy_ml_param["AUM"],"SPY Buy & Hold":spy_aum,
+    }
+    series_ret = {
+        "Opp.Band 1x":opp["ret"], "Curr.Band + VWAP 1x":curr["ret"], "Curr.Band + VWAP Dynamic":dyn["ret"],
+        "Maroy 2025 VWAP #1":maroy["ret"], "OWN v2 Adaptive Noise + Stop":own2_result["ret"], M9_NAME:m9_result["ret"],
+        M12_NAME:m12_result["ret"],MAROY_ML_NAME:maroy_ml["ret"],MAROY_HMM_NAME:maroy_hmm["ret"],MAROY_ML_PARAM_NAME:maroy_ml_param["ret"],"SPY Buy & Hold":spy_ret,
+    }
+    save_drawdown_chart(series_aum, FIGURE_DIR/"Figure_Drawdown_Comparison.png")
+    save_rolling_sharpe_chart(series_ret, FIGURE_DIR/"Figure_Rolling_252D_Sharpe.png", window=252)
+    save_annual_return_chart(annual, FIGURE_DIR/"Figure_Annual_Returns.png")
+    save_paper_overlap_chart(annual, FIGURE_DIR/"Figure_Dynamic_vs_Paper_2016_2024.png")
+    save_monthly_heatmap(monthly_dynamic, FIGURE_DIR/"Figure_Monthly_Return_Heatmap_Dynamic.png")
+
+    save_trade_metric_bar(trade_summary, "Hit Ratio (%)", FIGURE_DIR/"Figure_Trade_Hit_Ratio.png", "Trade Hit Ratio", "Hit Ratio (%)")
+    save_trade_metric_bar(trade_summary, "Avg. PnL x Share ($)", FIGURE_DIR/"Figure_Average_PnL_Per_Share.png", "Average PnL per Share", "PnL / Share ($)")
+    save_trade_metric_bar(trade_summary, "Trades", FIGURE_DIR/"Figure_Number_of_Trades.png", "Number of Trades", "Trades")
+
+    dow = day_of_week_table(dyn["ret"]); patterns = daily_patterns_table(daily, dyn["ret"])
+    dow.to_csv(DATA_DIR/"Table_6_Day_of_Week.csv", index=False); patterns.to_csv(DATA_DIR/"Table_5_Daily_Patterns.csv", index=False)
+    save_table_png(dow, TABLE_DIR/"Table_6_Day_of_Week.png", "Day-of-the-week conditional performance", font_size=8, scale_y=1.35)
+    save_table_png(patterns, TABLE_DIR/"Table_5_Daily_Patterns.png", "Daily-pattern conditional performance", font_size=8, scale_y=1.35)
+
+    rsi_tbl, rsi_payload = gamma_rsi_regression(daily, dyn["ret"])
+    if not rsi_tbl.empty:
+        rsi_tbl.to_csv(DATA_DIR/"Gamma_RSI5_Regression.csv", index=False)
+        save_table_png(rsi_tbl, TABLE_DIR/"Gamma_RSI5_Regression.png", "RSI(5) proxy regression - Dynamic strategy return", font_size=9, scale_y=1.4)
+        save_rsi_regression_figure(rsi_payload, FIGURE_DIR/"Gamma_RSI5_Regression_Scatter.png")
+
+    vix_tbl = vix_regime_table(dyn["ret"], vix)
+    if not vix_tbl.empty:
+        vix_tbl.to_csv(DATA_DIR/"Figure_8_VIX_Regime_Sharpe.csv", index=False)
+        save_table_png(vix_tbl, TABLE_DIR/"Figure_8_VIX_Regime_Table.png", "VIX-at-open regime analysis", font_size=8, scale_y=1.35)
+        save_vix_figure(vix_tbl, FIGURE_DIR/"Figure_8_VIX_Regime_Sharpe.png")
+
+    save_example_day(df, "2022-01-20", FIGURE_DIR/"Figure_4_Example_OppositeBand_2022-01-20.png", use_vwap=False)
+    save_example_day(df, "2022-01-20", FIGURE_DIR/"Figure_5_Example_CurrentBand_VWAP_2022-01-20.png", use_vwap=True)
+
+    vm_sensitivity = pd.DataFrame(); commission_sensitivity = pd.DataFrame()
+    if RUN_SENSITIVITY_ANALYSES:
+        vm_rows=[]
+        for vm in VM_GRID:
+            res,_=run_strategy(df,daily,all_days,f"VM {vm}","current_band_vwap","vol_target",band_mult=vm)
+            rr=res["ret"].dropna(); vm_rows.append({"Volatility Multiplier":vm,"Total Return (%)":((1+rr).prod()-1)*100 if len(rr) else np.nan,"Sharpe Ratio":rr.mean()/rr.std(ddof=1)*np.sqrt(252) if len(rr)>1 and rr.std(ddof=1)>0 else np.nan,"MDD (%)":max_drawdown_from_aum(res.loc[rr.index,"AUM"]) if len(rr) else np.nan})
+        vm_sensitivity=pd.DataFrame(vm_rows); vm_sensitivity.to_csv(DATA_DIR/"Figure_9_VM_Sensitivity.csv",index=False)
+        save_table_png(vm_sensitivity,TABLE_DIR/"Figure_9_VM_Sensitivity_Table.png","Volatility Multiplier sensitivity",font_size=8)
+        save_sensitivity_figure(vm_sensitivity,"Volatility Multiplier","Sharpe Ratio",FIGURE_DIR/"Figure_9A_VM_vs_Sharpe.png","Volatility Multiplier vs Sharpe Ratio","Sharpe Ratio")
+        save_sensitivity_figure(vm_sensitivity,"Volatility Multiplier","Total Return (%)",FIGURE_DIR/"Figure_9B_VM_vs_Total_Return.png","Volatility Multiplier vs Total Return","Total Return (%)")
+        comm_rows=[]
+        for c in COMMISSION_GRID:
+            res,_=run_strategy(df,daily,all_days,f"Commission {c}","current_band_vwap","vol_target",commission_per_share=c,slippage_per_share=SLIPPAGE_PER_SHARE)
+            rr=res["ret"].dropna(); comm_rows.append({"Commission ($/share)":c,"Total Return (%)":((1+rr).prod()-1)*100 if len(rr) else np.nan,"IRR (%)":((1+rr).prod()**(252/len(rr))-1)*100 if len(rr) else np.nan,"Sharpe Ratio":rr.mean()/rr.std(ddof=1)*np.sqrt(252) if len(rr)>1 and rr.std(ddof=1)>0 else np.nan})
+        commission_sensitivity=pd.DataFrame(comm_rows); commission_sensitivity.to_csv(DATA_DIR/"Figure_10_Commission_Sensitivity.csv",index=False)
+        save_table_png(commission_sensitivity,TABLE_DIR/"Figure_10_Commission_Sensitivity_Table.png","Commission sensitivity",font_size=8)
+        save_sensitivity_figure(commission_sensitivity,"Commission ($/share)","Total Return (%)",FIGURE_DIR/"Figure_10_Commission_Impact.png","Impact of commissions on total return","Total Return (%)")
+
+    # Dedicated retained Task 3 outputs.
+    maroy_reported.to_csv(DATA_DIR/"13A_Maroy_2025_Reported_VWAP1_Benchmark.csv", index=False)
+    maroy_parameters.to_csv(DATA_DIR/"13B_Maroy_2025_VWAP1_Published_Parameters.csv", index=False)
+    split_comparison.to_csv(DATA_DIR/"17_Train_Validation_Test_Comparison.csv", index=False)
+    monthly_maroy.to_csv(DATA_DIR/"19_Monthly_Maroy_Returns.csv")
+    own2_tuning.to_csv(DATA_DIR/"22_Own_v2_Adaptive_Noise_Validation_Tuning.csv", index=False)
+    monthly_own2.to_csv(DATA_DIR/"23_Monthly_Own_v2_Adaptive_Noise_Returns.csv")
+    monthly_m9.to_csv(DATA_DIR/"24_Monthly_M9_BiLSTM_q10_q90_Returns.csv")
+    monthly_m12.to_csv(DATA_DIR/"25_Monthly_M12_Inverse_Variance_Returns.csv")
+    monthly_maroy_ml.to_csv(DATA_DIR/"26_Monthly_Maroy_Monthly_Validated_Returns.csv")
+    monthly_maroy_hmm.to_csv(DATA_DIR/"27_Monthly_Maroy_HMM_Returns.csv")
+    maroy_ml_selection.to_csv(DATA_DIR/"28_Maroy_Monthly_Parameter_Selection.csv",index=False)
+    maroy_hmm_selection.to_csv(DATA_DIR/"29_Maroy_HMM_State_Parameter_Selection.csv",index=False)
+    monthly_maroy_ml_param.to_csv(DATA_DIR/"30_Monthly_Maroy_ML_Parameter_Returns.csv")
+    maroy_ml_param_selection.to_csv(DATA_DIR/"31_Maroy_ML_Parameter_Predictions.csv",index=False)
+    save_table_png(split_comparison, TABLE_DIR/"Task3_Train_Validation_Test_Summary.png", "Task 3 - Baseline vs Maroy vs OWN v2 by chronological split", font_size=8, scale_y=1.35)
+    save_table_png(monthly_maroy.reset_index(), TABLE_DIR/"Maroy_Monthly_Returns.png", "Maroy 2025 VWAP #1 adaptation monthly returns (%)", font_size=7, scale_y=1.35)
+    save_table_png(own2_tuning, TABLE_DIR/"Task3_Own_v2_Adaptive_Noise_Validation_Tuning.png", f"OWN v2 adaptive-noise validation tuning - q_regime={own2_threshold:.2f}", font_size=8, scale_y=1.35)
+    save_table_png(monthly_own2.reset_index(), TABLE_DIR/"Task3_Own_v2_Adaptive_Noise_Monthly_Returns.png", "OWN v2 Adaptive Noise + Stop monthly returns (%)", font_size=7, scale_y=1.35)
+    save_table_png(monthly_m9.reset_index(), TABLE_DIR/"Task3_M9_BiLSTM_Monthly_Returns.png", "M9 BiLSTM q10/q90 monthly returns (%)", font_size=7, scale_y=1.35)
+    save_table_png(maroy_ml_selection,TABLE_DIR/"Maroy_Monthly_Parameter_Selection.png","Maroy profile chosen from prior month's validation",font_size=7,scale_y=1.25)
+    save_table_png(maroy_hmm_selection,TABLE_DIR/"Maroy_HMM_State_Parameter_Selection.png","Maroy HMM regime/profile decisions",font_size=7,scale_y=1.25,max_rows=80)
+    save_table_png(maroy_ml_param_selection,TABLE_DIR/"Maroy_ML_Parameter_Predictions.png","Walk-forward ML predicted Maroy profile",font_size=7,scale_y=1.25)
+    save_task3_test_equity_chart(dyn, maroy, own2_result, spy_ret, FIGURE_DIR/"Task3_TEST_Equity_Baseline_vs_Maroy_vs_OwnV2.png", m9_result)
+    save_split_sharpe_chart(split_comparison, FIGURE_DIR/"Task3_Sharpe_by_Train_Validation_Test.png")
+    save_monthly_heatmap(monthly_own2, FIGURE_DIR/"Task3_Monthly_Return_Heatmap_Own_v2.png")
+    test_only=split_comparison[split_comparison["Split"]=="Test"].copy()
+    save_table_png(test_only, TABLE_DIR/"Task3_TEST_Performance_Comparison.png", "Task 3 - TEST: baseline vs Maroy vs OWN v2", font_size=8, scale_y=1.4)
+
+    drawdown_export=pd.DataFrame(index=all_days); drawdown_export.index.name="Day"
+    rolling_sharpe_export=pd.DataFrame(index=all_days); rolling_sharpe_export.index.name="Day"
+    for key,res in [("OppBand",opp),("CurrVWAP1x",curr),("Dynamic",dyn),("Maroy",maroy),("OwnAdaptiveV2",own2_result),("M9_BiLSTM",m9_result),("M12",m12_result),("MaroyMonthly",maroy_ml),("MaroyHMM",maroy_hmm),("MaroyMLParam",maroy_ml_param)]:
+        drawdown_export[f"{key}_DD_pct"]=drawdown_series(res["AUM"]).reindex(all_days)
+        rolling_sharpe_export[f"{key}_RollingSharpe"]=rolling_sharpe(res["ret"]).reindex(all_days)
+    drawdown_export["SPY_DD_pct"]=drawdown_series(spy_aum).reindex(all_days)
+    rolling_sharpe_export["SPY_RollingSharpe"]=rolling_sharpe(spy_ret).reindex(all_days)
+
+    # Core CSV exports.
+    portfolio_summary.to_csv(DATA_DIR/"01_Portfolio_Summary.csv",index=False)
+    paper_benchmark.to_csv(DATA_DIR/"02_Paper_Portfolio_Benchmark.csv",index=False)
+    trade_summary.to_csv(DATA_DIR/"03_Trade_Summary.csv",index=False)
+    paper_trade_benchmark.to_csv(DATA_DIR/"04_Paper_Trade_Benchmark.csv",index=False)
+    annual.to_csv(DATA_DIR/"05_Annual_Returns.csv"); monthly_dynamic.to_csv(DATA_DIR/"06_Monthly_Dynamic_Returns.csv")
+    daily_audit.to_csv(DATA_DIR/"07_Daily_Audit.csv"); all_trades.to_csv(DATA_DIR/"08_All_Trades.csv",index=False)
+    paper_vs_yours.to_csv(DATA_DIR/"09_Paper_vs_Your_Portfolio.csv"); trade_paper_vs_yours.to_csv(DATA_DIR/"10_Paper_vs_Your_Trades.csv")
+    drawdown_export.to_csv(DATA_DIR/"11_Drawdown_Series.csv"); rolling_sharpe_export.to_csv(DATA_DIR/"12_Rolling_Sharpe_Series.csv")
+
+    excel_path=OUTPUT_DIR/"SPY_Paper_Replication_Report.xlsx"
+    try:
+        with pd.ExcelWriter(excel_path,engine="openpyxl") as writer:
+            portfolio_summary.to_excel(writer,sheet_name="Your Summary",index=False)
+            paper_benchmark.to_excel(writer,sheet_name="Paper Portfolio",index=False)
+            trade_summary.to_excel(writer,sheet_name="Trade Summary",index=False)
+            paper_trade_benchmark.to_excel(writer,sheet_name="Paper Trades",index=False)
+            annual.to_excel(writer,sheet_name="Annual Returns"); monthly_dynamic.to_excel(writer,sheet_name="Monthly Dynamic")
+            daily_audit.to_excel(writer,sheet_name="Daily Audit"); all_trades.to_excel(writer,sheet_name="All Trades",index=False)
+            paper_vs_yours.to_excel(writer,sheet_name="Paper vs Your Portfolio"); trade_paper_vs_yours.to_excel(writer,sheet_name="Paper vs Your Trades")
+            drawdown_export.to_excel(writer,sheet_name="Drawdowns"); rolling_sharpe_export.to_excel(writer,sheet_name="Rolling Sharpe")
+            dow.to_excel(writer,sheet_name="Day of Week",index=False); patterns.to_excel(writer,sheet_name="Daily Patterns",index=False)
+            if not rsi_tbl.empty: rsi_tbl.to_excel(writer,sheet_name="RSI5 Regression",index=False)
+            if not vix_tbl.empty: vix_tbl.to_excel(writer,sheet_name="VIX Regimes",index=False)
+            if not vm_sensitivity.empty: vm_sensitivity.to_excel(writer,sheet_name="VM Sensitivity",index=False)
+            if not commission_sensitivity.empty: commission_sensitivity.to_excel(writer,sheet_name="Commission Sens",index=False)
+            split_comparison.to_excel(writer,sheet_name="Train Val Test",index=False)
+            monthly_maroy.to_excel(writer,sheet_name="Monthly Maroy")
+            monthly_own2.to_excel(writer,sheet_name="Monthly Own v2")
+            monthly_m9.to_excel(writer,sheet_name="Monthly M9 BiLSTM")
+            monthly_m12.to_excel(writer,sheet_name="Monthly M12 Inv Var")
+            monthly_maroy_ml.to_excel(writer,sheet_name="Monthly Maroy ML")
+            monthly_maroy_hmm.to_excel(writer,sheet_name="Monthly Maroy HMM")
+            maroy_ml_selection.to_excel(writer,sheet_name="Maroy ML Selections",index=False)
+            maroy_hmm_selection.to_excel(writer,sheet_name="Maroy HMM States",index=False)
+            monthly_maroy_ml_param.to_excel(writer,sheet_name="Monthly Maroy ML Param")
+            maroy_ml_param_selection.to_excel(writer,sheet_name="Maroy ML Parameters",index=False)
+            own2_tuning.to_excel(writer,sheet_name="Own v2 Tuning",index=False)
+            maroy_reported.to_excel(writer,sheet_name="Maroy Reported",index=False)
+            maroy_parameters.to_excel(writer,sheet_name="Maroy Parameters",index=False)
+        print(f"\nExcel report exported: {excel_path}")
+    except ImportError:
+        print("\nExcel export skipped because openpyxl is not installed.")
+
+    readme=f"""SPY INTRADAY MOMENTUM - CLEANED COMPARISON\n\nSample: {FROM_DATE} to {UNTIL_DATE}\nData: Alpaca {FEED.upper()}\nCommission: ${COMMISSION_PER_SHARE}/share, minimum ${MIN_COMMISSION_PER_ORDER}/order\nSlippage: ${SLIPPAGE_PER_SHARE}/share\n\nRETAINED BASE STRATEGIES\n- Opposite Band 1x; Current Band + VWAP 1x and dynamic; published Maroy; OWN v2; SPY Buy & Hold\n- Added M9 BiLSTM q10/q90 and M12 inverse-variance sizing\n- Added monthly-validation, HMM, and supervised ML Maroy parameter strategies\n\nCHRONOLOGICAL SPLIT\n- TRAIN: {SPLIT_TRAIN_START} to {SPLIT_TRAIN_END}\n- VALIDATION: {SPLIT_VALIDATION_START} to {SPLIT_VALIDATION_END}\n- TEST: {SPLIT_TEST_START} to {SPLIT_TEST_END}\n\nM9 BiLSTM\n- Predicts open-to-time q10/q90 return curves from the prior 20 sessions and current open-known state.\n- Retrains every {M9_RETRAIN_DAYS} sessions on up to {M9_TRAIN_DAYS} prior sessions; predictions are out of sample.\n\nM12\n- Uses the unchanged Current Band + VWAP signal and leverage min((target volatility / trailing daily volatility)^2, maximum leverage).\n\nMaroy walk-forward variants\n- Monthly validation: each calendar month's profile is selected using the prior calendar month's candidate returns only; first month defaults to the published VWAP #1 profile.\n- HMM: refits a 2-state diagonal Gaussian HMM monthly on up to {MAROY_HMM_TRAIN_DAYS} prior sessions using lagged realized volatility, overnight gap and VIX open/change when available. A causal filtered posterior assigns the current state. State-to-profile mapping uses only trailing candidate strategy results.\n- Each variant runs as its own continuous portfolio simulation; no returns are spliced from different strategy equity curves.\n- Candidate grid includes published VWAP #1/#2 and conservative variations of noise lookback, entry multiplier, target volatility and sampling frequency.\n- Supervised ML uses a Random Forest fit on prior completed months. At each month start, trailing realized volatility, return momentum, overnight gaps and VIX features predict the profile expected to have the best Sharpe in the next month. The resulting portfolio is directly simulated with that one profile.\n- Labels are only added to the training set after their month closes. Before 12 labeled months or with insufficient class diversity, selection falls back to the causal prior-month validation profile.\n- The provided Maroy paper optimizes on QQQ 1-second data over its study sample. This SPY 1-minute transfer and monthly tuning is an experiment, not an expected performance guarantee.\n"""
+    (OUTPUT_DIR/"00_README_RESULTS.txt").write_text(readme)
+
+    files=sorted([p for p in OUTPUT_DIR.rglob("*") if p.is_file() and "cache" not in p.parts])
+    manifest=pd.DataFrame({"File":[str(p.relative_to(OUTPUT_DIR)) for p in files],"Type":[p.suffix.lower().lstrip(".") for p in files]})
+    manifest.to_csv(OUTPUT_DIR/"00_OUTPUT_MANIFEST.csv",index=False)
+    (OUTPUT_DIR/"00_OUTPUT_MANIFEST.txt").write_text("\n".join(manifest["File"].tolist()))
+    zip_path=OUTPUT_DIR/"SPY_Paper_Replication_All_Outputs.zip"
+    with zipfile.ZipFile(zip_path,"w",compression=zipfile.ZIP_DEFLATED) as zf:
+        for pth in sorted(OUTPUT_DIR.rglob("*")):
+            if not pth.is_file() or "cache" in pth.parts or pth==zip_path: continue
+            zf.write(pth,arcname=str(pth.relative_to(OUTPUT_DIR)))
+
+    print(f"\nEquity graph exported: {graph_path}")
+    print(f"Tables: {TABLE_DIR}")
+    print(f"Figures: {FIGURE_DIR}")
+    print(f"Data: {DATA_DIR}")
+    print(f"ZIP: {zip_path}")
+
+
+if __name__ == "__main__":
+    main()
